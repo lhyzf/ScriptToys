@@ -1,0 +1,35 @@
+{
+    "longRunning": [
+        {
+            "title": "定时任务",
+            "displayName": "启动定时任务",
+            "stopDisplayName": "停止定时任务",
+            "scriptPath": "scripts/ScheduledTask.ps1",
+            "autoStart": true
+        },
+        {
+            "title": "定时任务",
+            "displayName": "启动定时任务",
+            "stopDisplayName": "停止定时任务",
+            "scriptPath": "scripts/ScheduledTask.ps1",
+            "autoStart": false
+        }
+    ],
+    "oneTime": [
+        {
+            "title": "手动任务",
+            "displayName": "执行任务",
+            "scriptPath": "scripts/Task.ps1"
+        },
+        {
+            "title": "手动任务",
+            "displayName": "执行任务",
+            "scriptPath": "scripts/Task.ps1"
+        },
+        {
+            "title": "手动任务2",
+            "displayName": "执行任务",
+            "scriptPath": "scripts/Task.ps1"
+        }
+    ]
+}
