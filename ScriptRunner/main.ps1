@@ -72,8 +72,14 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
         }
 
         try {
-            $arguments = @('-File', "`"$resolvedScriptPath`"")
-            $process = Start-Process -FilePath "pwsh.exe" -ArgumentList $arguments -PassThru
+            $extension = [System.IO.Path]::GetExtension($resolvedScriptPath)
+            if ($extension -ieq '.ps1') {
+                # Run PowerShell scripts through pwsh to keep behaviour consistent.
+                $arguments = @('-File', "`"$resolvedScriptPath`"")
+                $process = Start-Process -FilePath "pwsh.exe" -ArgumentList $arguments -PassThru
+            } else {
+                $process = Start-Process -FilePath $resolvedScriptPath -PassThru
+            }
         } catch {
             Show-Message "启动 $JobDescription 失败: $_" ([System.Windows.MessageBoxImage]::Error)
             return $false
@@ -167,7 +173,20 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
     $SyncHash.Config = $config
 
     # 拼接 XAML
-    $oneTimeGroups = $config.oneTime | Group-Object -Property title
+    $oneTimeGroups = [System.Collections.ArrayList]::new()
+    $oneTimeLookup = @{}
+    foreach ($item in $config.oneTime) {
+        $titleKey = [string]$item.title
+        if (-not $oneTimeLookup.ContainsKey($titleKey)) {
+            $group = [pscustomobject]@{
+                Name  = $titleKey
+                Group = [System.Collections.ArrayList]::new()
+            }
+            $null = $oneTimeGroups.Add($group)
+            $oneTimeLookup[$titleKey] = $group
+        }
+        $null = $oneTimeLookup[$titleKey].Group.Add($item)
+    }
     $totalRows = $config.longRunning.Count + $oneTimeGroups.Count
     $InputXml = @"
 <Window x:Class="ScriptRunner.MainWindow"
