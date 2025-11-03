@@ -1,1 +1,0 @@
-pwsh -File "main.ps1"
