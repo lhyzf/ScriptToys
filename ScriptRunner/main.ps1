@@ -35,6 +35,20 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
         [System.Windows.MessageBox]::Show($SyncHash.Form, $Message, "提示", [System.Windows.MessageBoxButton]::OK, $Icon) | Out-Null
     }
 
+    function Resolve-ScriptPath {
+        param([string]$Path)
+
+        if ([string]::IsNullOrWhiteSpace($Path)) {
+            return $Path
+        }
+
+        if ([System.IO.Path]::IsPathRooted($Path)) {
+            return $Path
+        }
+
+        return Join-Path $SyncHash.ScriptRoot $Path
+    }
+
     # --- 核心逻辑函数 ---
     function Start-ScriptJob {
         param(
@@ -50,13 +64,15 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
             return $false
         }
 
-        if (-not (Test-Path $ScriptPath)) {
-            Show-Message "错误: 未找到脚本 '$ScriptPath'" ([System.Windows.MessageBoxImage]::Error)
+        $resolvedScriptPath = Resolve-ScriptPath -Path $ScriptPath
+
+        if (-not (Test-Path $resolvedScriptPath)) {
+            Show-Message "错误: 未找到脚本 '$resolvedScriptPath'" ([System.Windows.MessageBoxImage]::Error)
             return $false
         }
 
         try {
-            $arguments = @('-File', "`"$ScriptPath`"")
+            $arguments = @('-File', "`"$resolvedScriptPath`"")
             $process = Start-Process -FilePath "pwsh.exe" -ArgumentList $arguments -PassThru
         } catch {
             Show-Message "启动 $JobDescription 失败: $_" ([System.Windows.MessageBoxImage]::Error)
@@ -305,17 +321,16 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
     function Register-ManualRun {
         param(
             [System.Windows.Controls.Button]$Button,
-            [string]$ScriptName,
+            [string]$ScriptPath,
             [string]$JobName,
             [string]$Description
         )
 
         $handler = {
-            $scriptPath = Join-Path $SyncHash.ScriptRoot $ScriptName
             $onStart = { Set-ManualButtonsState -IsEnabled $false }
             $onExit = { Set-ManualButtonsState -IsEnabled $true }
 
-            if (-not (Start-ScriptJob -JobName $JobName -ScriptPath $scriptPath -JobDescription $Description -OnStart $onStart -OnExit $onExit)) {
+            if (-not (Start-ScriptJob -JobName $JobName -ScriptPath $ScriptPath -JobDescription $Description -OnStart $onStart -OnExit $onExit)) {
                 Set-ManualButtonsState -IsEnabled $true
             }
         }.GetNewClosure()
@@ -329,7 +344,7 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
             $jobName = "ScheduledTask$i"
             $item = $SyncHash.Config.longRunning[$i]
             if ($item.autoStart) {
-                $scriptPath = Join-Path $SyncHash.ScriptRoot $item.scriptPath
+                $scriptPath = $item.scriptPath
                 $description = if ([string]::IsNullOrWhiteSpace($item.title)) { $item.displayName } else { $item.title }
                 Start-ScriptJob -JobName $jobName -ScriptPath $scriptPath -JobDescription $description -OnStart $ScheduledOnStartCallback -OnExit $ScheduledOnExitCallback | Out-Null
             }
@@ -352,7 +367,7 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
             $jobNameLocal = $startHandlerJobName
             $indexLocal = $startHandlerIndex
             $item = $SyncHash.Config.longRunning[$indexLocal]
-            $scriptPath = Join-Path $SyncHash.ScriptRoot $item.scriptPath
+            $scriptPath = $item.scriptPath
             $description = if ([string]::IsNullOrWhiteSpace($item.title)) { $item.displayName } else { $item.title }
             Start-ScriptJob -JobName $jobNameLocal -ScriptPath $scriptPath -JobDescription $description -OnStart $ScheduledOnStartCallback -OnExit $ScheduledOnExitCallback | Out-Null
         }.GetNewClosure()
@@ -376,7 +391,7 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
     $buttonIndex = 0
     foreach ($item in $config.oneTime) {
         $buttonName = "RunButton$buttonIndex"
-        Register-ManualRun -Button $SyncHash[$buttonName] -ScriptName $item.scriptPath -JobName "Manual$item.displayName" -Description $item.displayName
+        Register-ManualRun -Button $SyncHash[$buttonName] -ScriptPath $item.scriptPath -JobName "Manual$item.displayName" -Description $item.displayName
         $buttonIndex++
     }
 
