@@ -194,7 +194,6 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="脚本执行器"
         SizeToContent="WidthAndHeight"
-        ResizeMode="CanMinimize"
         ThemeMode="Light"
         Background="White">
     <Grid Margin="10">
