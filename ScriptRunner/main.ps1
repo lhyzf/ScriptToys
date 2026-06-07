@@ -49,6 +49,45 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
         return Join-Path $SyncHash.ScriptRoot $Path
     }
 
+    function Split-CommandAndArguments {
+        param([string]$CommandLine)
+
+        if ([string]::IsNullOrWhiteSpace($CommandLine)) {
+            return @{
+                CommandPath = $CommandLine
+                Arguments   = ''
+            }
+        }
+
+        $trimmed = $CommandLine.Trim()
+
+        if ($trimmed -match '^"(?<cmd>[^"]+)"\s*(?<args>.*)$') {
+            return @{
+                CommandPath = $Matches.cmd
+                Arguments   = $Matches.args
+            }
+        }
+
+        if ($trimmed -match "^'(?<cmd>[^']+)'\s*(?<args>.*)$") {
+            return @{
+                CommandPath = $Matches.cmd
+                Arguments   = $Matches.args
+            }
+        }
+
+        if ($trimmed -match '^(?<cmd>\S+)\s*(?<args>.*)$') {
+            return @{
+                CommandPath = $Matches.cmd
+                Arguments   = $Matches.args
+            }
+        }
+
+        return @{
+            CommandPath = $trimmed
+            Arguments   = ''
+        }
+    }
+
     # --- 核心逻辑函数 ---
     function Start-ScriptJob {
         param(
@@ -64,7 +103,10 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
             return $false
         }
 
-        $resolvedScriptPath = Resolve-ScriptPath -Path $ScriptPath
+        $commandSpec = Split-CommandAndArguments -CommandLine $ScriptPath
+        $rawCommandPath = $commandSpec.CommandPath
+        $rawArguments = $commandSpec.Arguments
+        $resolvedScriptPath = Resolve-ScriptPath -Path $rawCommandPath
 
         if (-not (Test-Path $resolvedScriptPath)) {
             Show-Message "错误: 未找到脚本 '$resolvedScriptPath'" ([System.Windows.MessageBoxImage]::Error)
@@ -75,10 +117,17 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
             $extension = [System.IO.Path]::GetExtension($resolvedScriptPath)
             if ($extension -ieq '.ps1') {
                 # Run PowerShell scripts through pwsh to keep behaviour consistent.
-                $arguments = @('-File', "`"$resolvedScriptPath`"")
-                $process = Start-Process -FilePath "pwsh.exe" -ArgumentList $arguments -PassThru
+                $pwshArguments = "-File `"$resolvedScriptPath`""
+                if (-not [string]::IsNullOrWhiteSpace($rawArguments)) {
+                    $pwshArguments = "$pwshArguments $rawArguments"
+                }
+                $process = Start-Process -FilePath "pwsh.exe" -ArgumentList $pwshArguments -PassThru
             } else {
-                $process = Start-Process -FilePath $resolvedScriptPath -PassThru
+                if ([string]::IsNullOrWhiteSpace($rawArguments)) {
+                    $process = Start-Process -FilePath $resolvedScriptPath -PassThru
+                } else {
+                    $process = Start-Process -FilePath $resolvedScriptPath -ArgumentList $rawArguments -PassThru
+                }
             }
         } catch {
             Show-Message "启动 $JobDescription 失败: $_" ([System.Windows.MessageBoxImage]::Error)
