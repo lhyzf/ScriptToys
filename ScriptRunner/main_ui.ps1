@@ -148,25 +148,24 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
     function Set-OutputTabState {
         param(
             [System.Windows.Controls.TabItem]$Tab,
-            [string]$JobDescription,
-            [string]$JobName,
+            [string]$TabLabel,
             [string]$Status,
             [bool]$CanClose
         )
 
-        $Tab.Header.Children[0].Text = "$JobDescription ($JobName) - $Status"
+        $Tab.Header.Children[0].Text = "$TabLabel - $Status"
         $Tab.Header.Children[1].IsEnabled = $CanClose
     }
 
     function New-JobOutputTab {
         param(
-            [string]$JobName,
-            [string]$JobDescription
+            [string]$TabKey,
+            [string]$TabLabel
         )
 
         foreach ($existingTab in $SyncHash.OutputTabs.Items) {
-            if ($existingTab.Tag -eq $JobName) {
-                Set-OutputTabState -Tab $existingTab -JobDescription $JobDescription -JobName $JobName -Status '运行中' -CanClose $false
+            if ($existingTab.Tag -eq $TabKey) {
+                Set-OutputTabState -Tab $existingTab -TabLabel $TabLabel -Status '运行中' -CanClose $false
                 $SyncHash.OutputTabs.SelectedItem = $existingTab
                 Add-OutputLine -TextBox $existingTab.Content -Line "--- 新一轮运行: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ---"
 
@@ -191,7 +190,7 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
         $header = [System.Windows.Controls.StackPanel]::new()
         $header.Orientation = [System.Windows.Controls.Orientation]::Horizontal
         $headerLabel = [System.Windows.Controls.TextBlock]::new()
-        $headerLabel.Text = "$JobDescription ($JobName) - 运行中"
+        $headerLabel.Text = "$TabLabel - 运行中"
         $headerLabel.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
         $closeButton = [System.Windows.Controls.Button]::new()
         $closeButton.Content = '×'
@@ -206,12 +205,14 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
 
         $tab = [System.Windows.Controls.TabItem]::new()
         $tab.Header = $header
-        $tab.Tag = $JobName
+        $tab.Tag = $TabKey
         $tab.Content = $textBox
 
         $closeHandler = {
-            if ($SyncHash.JobStates.ContainsKey($JobName)) {
-                return
+            foreach ($jobState in $SyncHash.JobStates.Values) {
+                if ([object]::ReferenceEquals($jobState.OutputTab, $tab)) {
+                    return
+                }
             }
 
             [void]$SyncHash.OutputTabs.Items.Remove($tab)
@@ -480,6 +481,8 @@ namespace ScriptRunner
                 Item        = $item
                 JobName     = "ManualTask$currentIndex"
                 Description = [string]$item.displayName
+                OutputTabKey = "ManualGroup:$($Group.Name)"
+                OutputTabLabel = [string]$Group.Name
                 Button      = $button
             })
 
@@ -560,6 +563,8 @@ namespace ScriptRunner
             [string]$ScriptPath,
             [string]$JobDescription,
             [psobject]$Item,
+            [string]$OutputTabKey,
+            [string]$OutputTabLabel,
             [scriptblock]$OnStart,
             [scriptblock]$OnExit
         )
@@ -584,7 +589,14 @@ namespace ScriptRunner
         $outputTextBox = $null
         $outputTabCreated = $false
         if ($useBuiltInOutput) {
-            $output = New-JobOutputTab -JobName $JobName -JobDescription $JobDescription
+            if ([string]::IsNullOrWhiteSpace($OutputTabKey)) {
+                $OutputTabKey = $JobName
+            }
+            if ([string]::IsNullOrWhiteSpace($OutputTabLabel)) {
+                $OutputTabLabel = $JobDescription
+            }
+
+            $output = New-JobOutputTab -TabKey $OutputTabKey -TabLabel $OutputTabLabel
             $outputTab = $output.Tab
             $outputTextBox = $output.TextBox
             $outputTabCreated = $output.Created
@@ -676,7 +688,7 @@ namespace ScriptRunner
                     $SyncHash.OutputTabs.Visibility = [System.Windows.Visibility]::Collapsed
                 }
             } elseif ($outputTab) {
-                Set-OutputTabState -Tab $outputTab -JobDescription $JobDescription -JobName $JobName -Status '启动失败' -CanClose $true
+                Set-OutputTabState -Tab $outputTab -TabLabel $OutputTabLabel -Status '启动失败' -CanClose $true
                 Add-OutputLine -TextBox $outputTextBox -Line "启动失败: $startupError"
             }
             Show-Message "启动 $JobDescription 失败: $startupError" ([System.Windows.MessageBoxImage]::Error)
@@ -690,6 +702,8 @@ namespace ScriptRunner
             Timer         = $null
             OnExit        = $OnExit
             OutputTab     = $outputTab
+            OutputTabKey  = $OutputTabKey
+            OutputTabLabel = $OutputTabLabel
             OutputTextBox = $outputTextBox
             OutputCapture = $outputCapture
         }
@@ -729,7 +743,7 @@ namespace ScriptRunner
                 $sender.Stop()
                 $SyncHash.JobStates.Remove($jobName)
                 if ($jobState.OutputTab) {
-                    Set-OutputTabState -Tab $jobState.OutputTab -JobDescription $jobState.Description -JobName $jobName -Status "已结束 ($exitCode)" -CanClose $true
+                    Set-OutputTabState -Tab $jobState.OutputTab -TabLabel $jobState.OutputTabLabel -Status "已结束 ($exitCode)" -CanClose $true
                 }
                 $jobState.Process.Dispose()
                 if ($jobState.OnExit) {
@@ -773,7 +787,7 @@ namespace ScriptRunner
 
         Flush-JobOutput -JobState $job
         if ($job.OutputTab) {
-            Set-OutputTabState -Tab $job.OutputTab -JobDescription $job.Description -JobName $JobName -Status '已停止' -CanClose $true
+            Set-OutputTabState -Tab $job.OutputTab -TabLabel $job.OutputTabLabel -Status '已停止' -CanClose $true
         }
 
         if ($job.Timer) {
@@ -807,12 +821,14 @@ namespace ScriptRunner
         $jobName = $Entry.JobName
         $scriptPath = [string]$Entry.Item.scriptPath
         $description = $Entry.Description
+        $outputTabKey = $Entry.OutputTabKey
+        $outputTabLabel = $Entry.OutputTabLabel
 
         $handler = {
             $onStart = { Set-ManualButtonsState -IsEnabled $false }
             $onExit = { Set-ManualButtonsState -IsEnabled $true }
 
-            if (-not (Start-ScriptJob -JobName $jobName -ScriptPath $scriptPath -JobDescription $description -Item $Entry.Item -OnStart $onStart -OnExit $onExit)) {
+            if (-not (Start-ScriptJob -JobName $jobName -ScriptPath $scriptPath -JobDescription $description -Item $Entry.Item -OutputTabKey $outputTabKey -OutputTabLabel $outputTabLabel -OnStart $onStart -OnExit $onExit)) {
                 Set-ManualButtonsState -IsEnabled $true
             }
         }.GetNewClosure()
