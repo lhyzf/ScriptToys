@@ -608,30 +608,67 @@ namespace ScriptRunner
         try {
             $extension = [System.IO.Path]::GetExtension($resolvedScriptPath)
             if ($useBuiltInOutput) {
+                $processPath = $resolvedScriptPath
+                $processArguments = $rawArguments
+                $processWorkingDirectory = $null
+
+                if ($extension -ieq '.lnk') {
+                    $shell = $null
+                    $shortcut = $null
+                    try {
+                        $shell = New-Object -ComObject WScript.Shell
+                        $shortcut = $shell.CreateShortcut($resolvedScriptPath)
+                        $processPath = [string]$shortcut.TargetPath
+                        $shortcutArguments = [string]$shortcut.Arguments
+                        $processWorkingDirectory = [string]$shortcut.WorkingDirectory
+                    } finally {
+                        if ($shortcut -and [System.Runtime.InteropServices.Marshal]::IsComObject($shortcut)) {
+                            [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut)
+                        }
+                        if ($shell -and [System.Runtime.InteropServices.Marshal]::IsComObject($shell)) {
+                            [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+                        }
+                    }
+
+                    if ([string]::IsNullOrWhiteSpace($processPath)) {
+                        throw "快捷方式没有有效的目标程序: $resolvedScriptPath"
+                    }
+                    if (-not [string]::IsNullOrWhiteSpace($shortcutArguments)) {
+                        $processArguments = $shortcutArguments
+                        if (-not [string]::IsNullOrWhiteSpace($rawArguments)) {
+                            $processArguments += " $rawArguments"
+                        }
+                    }
+                }
+
+                $extension = [System.IO.Path]::GetExtension($processPath)
                 Initialize-OutputCaptureType
                 $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
                 $startInfo.UseShellExecute = $false
                 $startInfo.CreateNoWindow = $true
                 $startInfo.RedirectStandardOutput = $true
                 $startInfo.RedirectStandardError = $true
+                if (-not [string]::IsNullOrWhiteSpace($processWorkingDirectory)) {
+                    $startInfo.WorkingDirectory = $processWorkingDirectory
+                }
 
                 if ($extension -ieq '.ps1') {
                     $startInfo.FileName = 'pwsh.exe'
-                    $startInfo.Arguments = "-File `"$resolvedScriptPath`""
-                    if (-not [string]::IsNullOrWhiteSpace($rawArguments)) {
-                        $startInfo.Arguments += " $rawArguments"
+                    $startInfo.Arguments = "-File `"$processPath`""
+                    if (-not [string]::IsNullOrWhiteSpace($processArguments)) {
+                        $startInfo.Arguments += " $processArguments"
                     }
                 } elseif ($extension -iin '.bat', '.cmd') {
                     $startInfo.FileName = if ([string]::IsNullOrWhiteSpace($env:ComSpec)) { 'cmd.exe' } else { $env:ComSpec }
-                    $commandLine = '""{0}"' -f $resolvedScriptPath
-                    if (-not [string]::IsNullOrWhiteSpace($rawArguments)) {
-                        $commandLine += " $rawArguments"
+                    $commandLine = '""{0}"' -f $processPath
+                    if (-not [string]::IsNullOrWhiteSpace($processArguments)) {
+                        $commandLine += " $processArguments"
                     }
                     $commandLine += '"'
                     $startInfo.Arguments = "/d /s /c $commandLine"
                 } else {
-                    $startInfo.FileName = $resolvedScriptPath
-                    $startInfo.Arguments = $rawArguments
+                    $startInfo.FileName = $processPath
+                    $startInfo.Arguments = $processArguments
                 }
 
                 $outputEncodingName = Get-OptionalOutputEncoding -Object $Item
@@ -649,7 +686,7 @@ namespace ScriptRunner
                 $process.add_ErrorDataReceived($outputHandler)
 
                 if (-not $process.Start()) {
-                    throw "无法启动进程 '$resolvedScriptPath'。"
+                    throw "无法启动进程 '$processPath'。"
                 }
                 $processStarted = $true
 
