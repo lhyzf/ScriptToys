@@ -77,6 +77,245 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
         return Join-Path $SyncHash.ScriptRoot $Path
     }
 
+    function Get-OptionalBoolean {
+        param(
+            [object]$Object,
+            [string]$PropertyName,
+            [bool]$DefaultValue
+        )
+
+        if ($null -eq $Object) {
+            return $DefaultValue
+        }
+
+        $property = $Object.PSObject.Properties[$PropertyName]
+        if ($null -eq $property -or $null -eq $property.Value) {
+            return $DefaultValue
+        }
+
+        if ($property.Value -isnot [bool]) {
+            throw "配置项 '$PropertyName' 必须是 true 或 false。"
+        }
+
+        return $property.Value
+    }
+
+    function Get-OptionalOutputEncoding {
+        param([object]$Object)
+
+        if ($null -eq $Object) {
+            return $null
+        }
+
+        $property = $Object.PSObject.Properties['outputEncoding']
+        if ($null -eq $property -or $null -eq $property.Value) {
+            return $null
+        }
+
+        if ($property.Value -is [string]) {
+            if ([string]::IsNullOrWhiteSpace($property.Value)) {
+                return $null
+            }
+
+            return $property.Value.Trim()
+        }
+
+        if ($property.Value -is [int] -or $property.Value -is [long]) {
+            return [long]$property.Value
+        }
+
+        throw "配置项 'outputEncoding' 必须是编码名称或代码页编号。"
+    }
+
+    function ConvertTo-TextEncoding {
+        param([object]$EncodingName)
+
+        if ($EncodingName -is [int] -or $EncodingName -is [long]) {
+            return [System.Text.Encoding]::GetEncoding([int]$EncodingName)
+        }
+
+        if ($null -ne $EncodingName) {
+            if ([string]$EncodingName -match '^\d+$') {
+                return [System.Text.Encoding]::GetEncoding([int]$EncodingName)
+            }
+
+            return [System.Text.Encoding]::GetEncoding([string]$EncodingName)
+        }
+
+        return [System.Text.Encoding]::UTF8
+    }
+
+    function Set-OutputTabState {
+        param(
+            [System.Windows.Controls.TabItem]$Tab,
+            [string]$JobDescription,
+            [string]$JobName,
+            [string]$Status,
+            [bool]$CanClose
+        )
+
+        $Tab.Header.Children[0].Text = "$JobDescription ($JobName) - $Status"
+        $Tab.Header.Children[1].IsEnabled = $CanClose
+    }
+
+    function New-JobOutputTab {
+        param(
+            [string]$JobName,
+            [string]$JobDescription
+        )
+
+        foreach ($existingTab in $SyncHash.OutputTabs.Items) {
+            if ($existingTab.Tag -eq $JobName) {
+                Set-OutputTabState -Tab $existingTab -JobDescription $JobDescription -JobName $JobName -Status '运行中' -CanClose $false
+                $SyncHash.OutputTabs.SelectedItem = $existingTab
+                Add-OutputLine -TextBox $existingTab.Content -Line "--- 新一轮运行: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ---"
+
+                return [pscustomobject]@{
+                    Tab     = $existingTab
+                    TextBox = $existingTab.Content
+                    Created = $false
+                }
+            }
+        }
+
+        $textBox = [System.Windows.Controls.TextBox]::new()
+        $textBox.IsReadOnly = $true
+        $textBox.AcceptsReturn = $true
+        $textBox.TextWrapping = [System.Windows.TextWrapping]::NoWrap
+        $textBox.VerticalScrollBarVisibility = [System.Windows.Controls.ScrollBarVisibility]::Auto
+        $textBox.HorizontalScrollBarVisibility = [System.Windows.Controls.ScrollBarVisibility]::Auto
+        $textBox.FontFamily = [System.Windows.Media.FontFamily]::new('Consolas')
+        $textBox.Margin = [System.Windows.Thickness]::new(4)
+        $textBox.Tag = 0
+
+        $header = [System.Windows.Controls.StackPanel]::new()
+        $header.Orientation = [System.Windows.Controls.Orientation]::Horizontal
+        $headerLabel = [System.Windows.Controls.TextBlock]::new()
+        $headerLabel.Text = "$JobDescription ($JobName) - 运行中"
+        $headerLabel.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+        $closeButton = [System.Windows.Controls.Button]::new()
+        $closeButton.Content = '×'
+        $closeButton.Width = 20
+        $closeButton.Height = 20
+        $closeButton.Margin = [System.Windows.Thickness]::new(6, 0, 0, 0)
+        $closeButton.Padding = [System.Windows.Thickness]::new(0)
+        $closeButton.IsEnabled = $false
+        $closeButton.ToolTip = '任务结束或停止后可关闭此标签'
+        [void]$header.Children.Add($headerLabel)
+        [void]$header.Children.Add($closeButton)
+
+        $tab = [System.Windows.Controls.TabItem]::new()
+        $tab.Header = $header
+        $tab.Tag = $JobName
+        $tab.Content = $textBox
+
+        $closeHandler = {
+            if ($SyncHash.JobStates.ContainsKey($JobName)) {
+                return
+            }
+
+            [void]$SyncHash.OutputTabs.Items.Remove($tab)
+            if ($SyncHash.OutputTabs.Items.Count -eq 0) {
+                $SyncHash.OutputTabs.Visibility = [System.Windows.Visibility]::Collapsed
+            }
+        }.GetNewClosure()
+        $closeButton.Add_Click($closeHandler)
+
+        [void]$SyncHash.OutputTabs.Items.Add($tab)
+        $SyncHash.OutputTabs.Visibility = [System.Windows.Visibility]::Visible
+        $SyncHash.OutputTabs.SelectedItem = $tab
+
+        return [pscustomobject]@{
+            Tab     = $tab
+            TextBox = $textBox
+            Created = $true
+        }
+    }
+
+    function Add-OutputLine {
+        param(
+            [System.Windows.Controls.TextBox]$TextBox,
+            [string]$Line
+        )
+
+        $TextBox.AppendText($Line + [Environment]::NewLine)
+
+        $addedLines = 1
+        $lineBreakIndex = $Line.IndexOf("`n")
+        while ($lineBreakIndex -ge 0) {
+            $addedLines++
+            $lineBreakIndex = $Line.IndexOf("`n", $lineBreakIndex + 1)
+        }
+
+        $lineCount = [int]$TextBox.Tag + $addedLines
+        $maxLines = 1000
+        $maxCharacters = 50000
+        while ($lineCount -gt $maxLines -or $TextBox.Text.Length -gt $maxCharacters) {
+            $lineEnd = $TextBox.Text.IndexOf("`n")
+            if ($lineEnd -lt 0) {
+                $TextBox.Clear()
+                $lineCount = 0
+                break
+            }
+
+            $TextBox.Select(0, $lineEnd + 1)
+            $TextBox.SelectedText = ''
+            $lineCount--
+        }
+        $TextBox.Tag = $lineCount
+
+        if ($SyncHash.OutputTabs.SelectedItem -and
+            [object]::ReferenceEquals($SyncHash.OutputTabs.SelectedItem.Content, $TextBox)) {
+            $TextBox.ScrollToEnd()
+        }
+    }
+
+    function Initialize-OutputCaptureType {
+        if ('ScriptRunner.OutputCapture' -as [type]) {
+            return
+        }
+
+        Add-Type -TypeDefinition @'
+using System.Collections.Concurrent;
+using System.Diagnostics;
+
+namespace ScriptRunner
+{
+    public sealed class OutputCapture
+    {
+        public readonly ConcurrentQueue<string> Lines = new ConcurrentQueue<string>();
+
+        public void OnDataReceived(object sender, DataReceivedEventArgs eventArgs)
+        {
+            if (eventArgs.Data != null)
+            {
+                Lines.Enqueue(eventArgs.Data);
+            }
+        }
+    }
+}
+'@ -ErrorAction Stop
+    }
+
+    function Flush-JobOutput {
+        param([hashtable]$JobState)
+
+        if (-not $JobState.OutputCapture) {
+            return
+        }
+
+        $line = $null
+        while ($JobState.OutputCapture.Lines.TryDequeue([ref]$line)) {
+            Add-OutputLine -TextBox $JobState.OutputTextBox -Line $line
+        }
+    }
+
+    function Get-UseBuiltInOutput {
+        param([psobject]$Item)
+
+        return (Get-OptionalBoolean -Object $Item -PropertyName 'useBuiltInOutput' -DefaultValue $SyncHash.Config.UseBuiltInOutput)
+    }
+
     function Split-CommandAndArguments {
         param([string]$CommandLine)
 
@@ -320,6 +559,7 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
             [string]$JobName,
             [string]$ScriptPath,
             [string]$JobDescription,
+            [psobject]$Item,
             [scriptblock]$OnStart,
             [scriptblock]$OnExit
         )
@@ -339,10 +579,71 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
             return $false
         }
 
+        $useBuiltInOutput = Get-UseBuiltInOutput -Item $Item
+        $outputTab = $null
+        $outputTextBox = $null
+        $outputTabCreated = $false
+        if ($useBuiltInOutput) {
+            $output = New-JobOutputTab -JobName $JobName -JobDescription $JobDescription
+            $outputTab = $output.Tab
+            $outputTextBox = $output.TextBox
+            $outputTabCreated = $output.Created
+        }
+
+        $process = $null
+        $outputCapture = $null
+        $processStarted = $false
         try {
             $extension = [System.IO.Path]::GetExtension($resolvedScriptPath)
-            if ($extension -ieq '.ps1') {
-                # 统一通过 pwsh 运行 PowerShell 脚本，保持行为一致。
+            if ($useBuiltInOutput) {
+                Initialize-OutputCaptureType
+                $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+                $startInfo.UseShellExecute = $false
+                $startInfo.CreateNoWindow = $true
+                $startInfo.RedirectStandardOutput = $true
+                $startInfo.RedirectStandardError = $true
+
+                if ($extension -ieq '.ps1') {
+                    $startInfo.FileName = 'pwsh.exe'
+                    $startInfo.Arguments = "-File `"$resolvedScriptPath`""
+                    if (-not [string]::IsNullOrWhiteSpace($rawArguments)) {
+                        $startInfo.Arguments += " $rawArguments"
+                    }
+                } elseif ($extension -iin '.bat', '.cmd') {
+                    $startInfo.FileName = if ([string]::IsNullOrWhiteSpace($env:ComSpec)) { 'cmd.exe' } else { $env:ComSpec }
+                    $commandLine = '""{0}"' -f $resolvedScriptPath
+                    if (-not [string]::IsNullOrWhiteSpace($rawArguments)) {
+                        $commandLine += " $rawArguments"
+                    }
+                    $commandLine += '"'
+                    $startInfo.Arguments = "/d /s /c $commandLine"
+                } else {
+                    $startInfo.FileName = $resolvedScriptPath
+                    $startInfo.Arguments = $rawArguments
+                }
+
+                $outputEncodingName = Get-OptionalOutputEncoding -Object $Item
+                if ($null -eq $outputEncodingName) {
+                    $outputEncodingName = $SyncHash.Config.OutputEncoding
+                }
+                $outputEncoding = ConvertTo-TextEncoding -EncodingName $outputEncodingName
+                $startInfo.StandardOutputEncoding = $outputEncoding
+                $startInfo.StandardErrorEncoding = $outputEncoding
+                $process = [System.Diagnostics.Process]::new()
+                $process.StartInfo = $startInfo
+                $outputCapture = [ScriptRunner.OutputCapture]::new()
+                $outputHandler = [System.Diagnostics.DataReceivedEventHandler]$outputCapture.OnDataReceived
+                $process.add_OutputDataReceived($outputHandler)
+                $process.add_ErrorDataReceived($outputHandler)
+
+                if (-not $process.Start()) {
+                    throw "无法启动进程 '$resolvedScriptPath'。"
+                }
+                $processStarted = $true
+
+                $process.BeginOutputReadLine()
+                $process.BeginErrorReadLine()
+            } elseif ($extension -ieq '.ps1') {
                 $pwshArguments = "-File `"$resolvedScriptPath`""
                 if (-not [string]::IsNullOrWhiteSpace($rawArguments)) {
                     $pwshArguments = "$pwshArguments $rawArguments"
@@ -356,16 +657,41 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
                 }
             }
         } catch {
-            Show-Message "启动 $JobDescription 失败: $_" ([System.Windows.MessageBoxImage]::Error)
+            $startupError = $_.Exception.Message
+            if ($process -and $useBuiltInOutput) {
+                try {
+                    if ($processStarted -and -not $process.HasExited) {
+                        $process.Kill($true)
+                        $process.WaitForExit()
+                    }
+                } catch {
+                    $startupError += "`n清理启动失败的进程时出错: $($_.Exception.Message)"
+                } finally {
+                    $process.Dispose()
+                }
+            }
+            if ($outputTabCreated) {
+                [void]$SyncHash.OutputTabs.Items.Remove($outputTab)
+                if ($SyncHash.OutputTabs.Items.Count -eq 0) {
+                    $SyncHash.OutputTabs.Visibility = [System.Windows.Visibility]::Collapsed
+                }
+            } elseif ($outputTab) {
+                Set-OutputTabState -Tab $outputTab -JobDescription $JobDescription -JobName $JobName -Status '启动失败' -CanClose $true
+                Add-OutputLine -TextBox $outputTextBox -Line "启动失败: $startupError"
+            }
+            Show-Message "启动 $JobDescription 失败: $startupError" ([System.Windows.MessageBoxImage]::Error)
             return $false
         }
 
         $SyncHash.JobStates[$JobName] = @{
-            Process     = $process
-            Description = $JobDescription
-            ProcessId   = $process.Id
-            Timer       = $null
-            OnExit      = $OnExit
+            Process       = $process
+            Description   = $JobDescription
+            ProcessId     = $process.Id
+            Timer         = $null
+            OnExit        = $OnExit
+            OutputTab     = $outputTab
+            OutputTextBox = $outputTextBox
+            OutputCapture = $outputCapture
         }
 
         if ($OnStart) {
@@ -373,7 +699,11 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
         }
 
         $timer = [System.Windows.Threading.DispatcherTimer]::new()
-        $timer.Interval = [TimeSpan]::FromSeconds(1)
+        if ($useBuiltInOutput) {
+            $timer.Interval = [TimeSpan]::FromMilliseconds(100)
+        } else {
+            $timer.Interval = [TimeSpan]::FromSeconds(1)
+        }
         $timer | Add-Member -NotePropertyName JobName -NotePropertyValue $JobName
         $timer.add_Tick({
             param($sender, $args)
@@ -390,10 +720,18 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
                 return
             }
 
+            Flush-JobOutput -JobState $jobState
             $jobState.Process.Refresh()
             if ($jobState.Process.HasExited) {
+                $jobState.Process.WaitForExit()
+                Flush-JobOutput -JobState $jobState
+                $exitCode = $jobState.Process.ExitCode
                 $sender.Stop()
                 $SyncHash.JobStates.Remove($jobName)
+                if ($jobState.OutputTab) {
+                    Set-OutputTabState -Tab $jobState.OutputTab -JobDescription $jobState.Description -JobName $jobName -Status "已结束 ($exitCode)" -CanClose $true
+                }
+                $jobState.Process.Dispose()
                 if ($jobState.OnExit) {
                     & $jobState.OnExit $jobName
                 }
@@ -418,7 +756,10 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
 
         try {
             if ($job.Process) {
-                $job.Process.Kill($true)
+                if (-not $job.Process.HasExited) {
+                    $job.Process.Kill($true)
+                }
+                $job.Process.WaitForExit()
             } elseif ($job.ProcessId) {
                 Stop-Process -Id $job.ProcessId -Force -ErrorAction Stop
                 Wait-Process -Id $job.ProcessId -ErrorAction SilentlyContinue
@@ -430,8 +771,17 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
 
         $SyncHash.JobStates.Remove($JobName)
 
+        Flush-JobOutput -JobState $job
+        if ($job.OutputTab) {
+            Set-OutputTabState -Tab $job.OutputTab -JobDescription $job.Description -JobName $JobName -Status '已停止' -CanClose $true
+        }
+
         if ($job.Timer) {
             $job.Timer.Stop()
+        }
+
+        if ($job.Process) {
+            $job.Process.Dispose()
         }
 
         if ($onExit) {
@@ -462,7 +812,7 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
             $onStart = { Set-ManualButtonsState -IsEnabled $false }
             $onExit = { Set-ManualButtonsState -IsEnabled $true }
 
-            if (-not (Start-ScriptJob -JobName $jobName -ScriptPath $scriptPath -JobDescription $description -OnStart $onStart -OnExit $onExit)) {
+            if (-not (Start-ScriptJob -JobName $jobName -ScriptPath $scriptPath -JobDescription $description -Item $Entry.Item -OnStart $onStart -OnExit $onExit)) {
                 Set-ManualButtonsState -IsEnabled $true
             }
         }.GetNewClosure()
@@ -484,7 +834,7 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
         $SyncHash.OneTimeGroups = $oneTimeGroups
 
         $totalRows = $SyncHash.Config.longRunning.Count + $oneTimeGroups.Count
-        for ($i = 0; $i -lt $totalRows; $i++) {
+        for ($i = 0; $i -le $totalRows; $i++) {
             $rowDefinition = [System.Windows.Controls.RowDefinition]::new()
             $rowDefinition.Height = [System.Windows.GridLength]::Auto
             [void]$grid.RowDefinitions.Add($rowDefinition)
@@ -505,6 +855,20 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
             $rowIndex++
         }
 
+        $outputTabs = [System.Windows.Controls.TabControl]::new()
+        $outputTabs.Height = 300
+        $outputTabs.Margin = [System.Windows.Thickness]::new(0, 5, 0, 0)
+        $outputTabs.Visibility = [System.Windows.Visibility]::Collapsed
+        [System.Windows.Controls.Grid]::SetRow($outputTabs, $totalRows)
+        [void]$grid.Children.Add($outputTabs)
+        $SyncHash.OutputTabs = $outputTabs
+        $outputTabs.Add_SelectionChanged({
+            $selectedTab = $SyncHash.OutputTabs.SelectedItem
+            if ($selectedTab -and $selectedTab.Content -is [System.Windows.Controls.TextBox]) {
+                $selectedTab.Content.ScrollToEnd()
+            }
+        })
+
         return $window
     }
 
@@ -517,14 +881,29 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
 
     try {
         $config = Get-Content $configPath -Raw | ConvertFrom-Json
+        $globalUseBuiltInOutput = Get-OptionalBoolean -Object $config.ui -PropertyName 'useBuiltInOutput' -DefaultValue $false
+        $globalOutputEncoding = Get-OptionalOutputEncoding -Object $config.ui
+        if ($null -ne $globalOutputEncoding) {
+            $null = ConvertTo-TextEncoding -EncodingName $globalOutputEncoding
+        }
+
+        foreach ($item in @($config.longRunning) + @($config.oneTime)) {
+            $null = Get-OptionalBoolean -Object $item -PropertyName 'useBuiltInOutput' -DefaultValue $globalUseBuiltInOutput
+            $itemOutputEncoding = Get-OptionalOutputEncoding -Object $item
+            if ($null -ne $itemOutputEncoding) {
+                $null = ConvertTo-TextEncoding -EncodingName $itemOutputEncoding
+            }
+        }
     } catch {
         Show-Message "读取配置文件失败: $_" ([System.Windows.MessageBoxImage]::Error)
         return
     }
 
     $SyncHash.Config = [pscustomobject]@{
-        longRunning = @($config.longRunning)
-        oneTime     = @($config.oneTime)
+        UseBuiltInOutput = $globalUseBuiltInOutput
+        OutputEncoding   = $globalOutputEncoding
+        longRunning      = @($config.longRunning)
+        oneTime          = @($config.oneTime)
     }
 
     $SyncHash.Form = New-MainWindow
@@ -544,7 +923,7 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
         foreach ($entry in $SyncHash.ScheduledUi) {
             if ($entry.Item.autoStart) {
                 $description = Get-DisplayDescription -Title ([string]$entry.Item.title) -DisplayName ([string]$entry.Item.displayName)
-                Start-ScriptJob -JobName $entry.JobName -ScriptPath ([string]$entry.Item.scriptPath) -JobDescription $description -OnStart $ScheduledOnStartCallback -OnExit $ScheduledOnExitCallback | Out-Null
+                Start-ScriptJob -JobName $entry.JobName -ScriptPath ([string]$entry.Item.scriptPath) -JobDescription $description -Item $entry.Item -OnStart $ScheduledOnStartCallback -OnExit $ScheduledOnExitCallback | Out-Null
             }
         }
     })
@@ -559,7 +938,7 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
 
         $startHandler = {
             $description = Get-DisplayDescription -Title ([string]$scheduledItem.title) -DisplayName ([string]$scheduledItem.displayName)
-            Start-ScriptJob -JobName $jobName -ScriptPath ([string]$scheduledItem.scriptPath) -JobDescription $description -OnStart $ScheduledOnStartCallback -OnExit $ScheduledOnExitCallback | Out-Null
+            Start-ScriptJob -JobName $jobName -ScriptPath ([string]$scheduledItem.scriptPath) -JobDescription $description -Item $scheduledItem -OnStart $ScheduledOnStartCallback -OnExit $ScheduledOnExitCallback | Out-Null
         }.GetNewClosure()
 
         $stopHandler = {

@@ -1,4 +1,8 @@
 {
+    "ui": {
+        "useBuiltInOutput": true,
+        "outputEncoding": "GBK"
+    },
     "longRunning": [
         {
             "title": "定时任务",
