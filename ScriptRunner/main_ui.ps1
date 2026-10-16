@@ -157,6 +157,25 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
         $Tab.Header.Children[1].IsEnabled = $CanClose
     }
 
+    function Set-OutputTabsVisible {
+        param([bool]$IsVisible)
+
+        if ($IsVisible) {
+            if ($SyncHash.OperationsExpander.IsExpanded) {
+                $SyncHash.OperationsRow.Height = [System.Windows.GridLength]::new(2, [System.Windows.GridUnitType]::Star)
+            } else {
+                $SyncHash.OperationsRow.Height = [System.Windows.GridLength]::Auto
+            }
+            $SyncHash.OutputRow.Height = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+            $SyncHash.OutputTabs.Visibility = [System.Windows.Visibility]::Visible
+            return
+        }
+
+        $SyncHash.OutputTabs.Visibility = [System.Windows.Visibility]::Collapsed
+        $SyncHash.OutputRow.Height = [System.Windows.GridLength]::Auto
+        $SyncHash.OperationsRow.Height = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+    }
+
     function New-JobOutputTab {
         param(
             [string]$TabKey,
@@ -167,6 +186,7 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
             if ($existingTab.Tag -eq $TabKey) {
                 Set-OutputTabState -Tab $existingTab -TabLabel $TabLabel -Status '运行中' -CanClose $false
                 $SyncHash.OutputTabs.SelectedItem = $existingTab
+                Set-OutputTabsVisible -IsVisible $true
                 Add-OutputLine -TextBox $existingTab.Content -Line "--- 新一轮运行: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ---"
 
                 return [pscustomobject]@{
@@ -217,13 +237,13 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
 
             [void]$SyncHash.OutputTabs.Items.Remove($tab)
             if ($SyncHash.OutputTabs.Items.Count -eq 0) {
-                $SyncHash.OutputTabs.Visibility = [System.Windows.Visibility]::Collapsed
+                Set-OutputTabsVisible -IsVisible $false
             }
         }.GetNewClosure()
         $closeButton.Add_Click($closeHandler)
 
         [void]$SyncHash.OutputTabs.Items.Add($tab)
-        $SyncHash.OutputTabs.Visibility = [System.Windows.Visibility]::Visible
+        Set-OutputTabsVisible -IsVisible $true
         $SyncHash.OutputTabs.SelectedItem = $tab
 
         return [pscustomobject]@{
@@ -722,7 +742,7 @@ namespace ScriptRunner
             if ($outputTabCreated) {
                 [void]$SyncHash.OutputTabs.Items.Remove($outputTab)
                 if ($SyncHash.OutputTabs.Items.Count -eq 0) {
-                    $SyncHash.OutputTabs.Visibility = [System.Windows.Visibility]::Collapsed
+                    Set-OutputTabsVisible -IsVisible $false
                 }
             } elseif ($outputTab) {
                 Set-OutputTabState -Tab $outputTab -TabLabel $OutputTabLabel -Status '启动失败' -CanClose $true
@@ -876,45 +896,65 @@ namespace ScriptRunner
     function New-MainWindow {
         $window = [System.Windows.Window]::new()
         $window.Title = '脚本执行器'
-        $window.SizeToContent = [System.Windows.SizeToContent]::WidthAndHeight
+        $window.SizeToContent = [System.Windows.SizeToContent]::Manual
         $window.Background = [System.Windows.Media.Brushes]::White
 
         $grid = [System.Windows.Controls.Grid]::new()
         $grid.Margin = [System.Windows.Thickness]::new(10)
         $window.Content = $grid
 
+        $operationsRow = [System.Windows.Controls.RowDefinition]::new()
+        $operationsRow.Height = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+        [void]$grid.RowDefinitions.Add($operationsRow)
+        $SyncHash.OperationsRow = $operationsRow
+
+        $outputRow = [System.Windows.Controls.RowDefinition]::new()
+        $outputRow.Height = [System.Windows.GridLength]::Auto
+        [void]$grid.RowDefinitions.Add($outputRow)
+        $SyncHash.OutputRow = $outputRow
+
         $oneTimeGroups = Get-OneTimeGroups -Items $SyncHash.Config.oneTime
         $SyncHash.OneTimeGroups = $oneTimeGroups
 
-        $totalRows = $SyncHash.Config.longRunning.Count + $oneTimeGroups.Count
-        for ($i = 0; $i -le $totalRows; $i++) {
-            $rowDefinition = [System.Windows.Controls.RowDefinition]::new()
-            $rowDefinition.Height = [System.Windows.GridLength]::Auto
-            [void]$grid.RowDefinitions.Add($rowDefinition)
-        }
+        $operationsPanel = [System.Windows.Controls.StackPanel]::new()
 
         for ($i = 0; $i -lt $SyncHash.Config.longRunning.Count; $i++) {
             $groupBox = New-LongRunningGroup -Item $SyncHash.Config.longRunning[$i] -Index $i
-            [System.Windows.Controls.Grid]::SetRow($groupBox, $i)
-            [void]$grid.Children.Add($groupBox)
+            [void]$operationsPanel.Children.Add($groupBox)
         }
 
-        $rowIndex = $SyncHash.Config.longRunning.Count
         $buttonIndex = 0
         foreach ($group in $oneTimeGroups) {
             $groupBox = New-OneTimeGroup -Group $group -ButtonIndex ([ref]$buttonIndex)
-            [System.Windows.Controls.Grid]::SetRow($groupBox, $rowIndex)
-            [void]$grid.Children.Add($groupBox)
-            $rowIndex++
+            [void]$operationsPanel.Children.Add($groupBox)
         }
 
+        $operationsScroller = [System.Windows.Controls.ScrollViewer]::new()
+        $operationsScroller.VerticalScrollBarVisibility = [System.Windows.Controls.ScrollBarVisibility]::Auto
+        $operationsScroller.HorizontalScrollBarVisibility = [System.Windows.Controls.ScrollBarVisibility]::Disabled
+        $operationsScroller.Content = $operationsPanel
+
+        $operationsExpander = [System.Windows.Controls.Expander]::new()
+        $operationsExpander.Header = '任务操作'
+        $operationsExpander.IsExpanded = $true
+        $operationsExpander.Margin = [System.Windows.Thickness]::new(0, 0, 0, 5)
+        $operationsExpander.Content = $operationsScroller
+        [System.Windows.Controls.Grid]::SetRow($operationsExpander, 0)
+        [void]$grid.Children.Add($operationsExpander)
+        $SyncHash.OperationsExpander = $operationsExpander
+
         $outputTabs = [System.Windows.Controls.TabControl]::new()
-        $outputTabs.Height = 300
-        $outputTabs.Margin = [System.Windows.Thickness]::new(0, 5, 0, 0)
+        $outputTabs.Margin = [System.Windows.Thickness]::new(0, 0, 0, 0)
         $outputTabs.Visibility = [System.Windows.Visibility]::Collapsed
-        [System.Windows.Controls.Grid]::SetRow($outputTabs, $totalRows)
+        [System.Windows.Controls.Grid]::SetRow($outputTabs, 1)
         [void]$grid.Children.Add($outputTabs)
         $SyncHash.OutputTabs = $outputTabs
+        $operationsExpander.Add_Expanded({
+            Set-OutputTabsVisible -IsVisible ($SyncHash.OutputTabs.Visibility -eq [System.Windows.Visibility]::Visible)
+        })
+        $operationsExpander.Add_Collapsed({
+            Set-OutputTabsVisible -IsVisible ($SyncHash.OutputTabs.Visibility -eq [System.Windows.Visibility]::Visible)
+        })
         $outputTabs.Add_SelectionChanged({
             $selectedTab = $SyncHash.OutputTabs.SelectedItem
             if ($selectedTab -and $selectedTab.Content -is [System.Windows.Controls.TextBox]) {
