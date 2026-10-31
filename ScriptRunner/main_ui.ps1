@@ -7,8 +7,11 @@ $SyncHash = [hashtable]::Synchronized(@{})
 $SyncHash.Host = $host
 $SyncHash.ScriptRoot = $PSScriptRoot
 $SyncHash.JobStates = @{}
+$SyncHash.JobRecords = @{}
 $SyncHash.ScheduledUi = [System.Collections.ArrayList]::new()
 $SyncHash.ManualUi = [System.Collections.ArrayList]::new()
+$SyncHash.RetiredUi = [System.Collections.ArrayList]::new()
+$SyncHash.ConfigLastProcessedUtcTicks = 0L
 
 # UI 运行空间
 $UiRunspace = [runspacefactory]::CreateRunspace()
@@ -291,14 +294,17 @@ $UiPowerShell = [PowerShell]::Create().AddScript({
         }
     }
 
-    function Initialize-OutputCaptureType {
+    function Initialize-UiHelperTypes {
         if ('ScriptRunner.OutputCapture' -as [type]) {
             return
         }
 
         Add-Type -TypeDefinition @'
+using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.IO;
+using System.Threading;
 
 namespace ScriptRunner
 {
@@ -312,6 +318,43 @@ namespace ScriptRunner
             {
                 Lines.Enqueue(eventArgs.Data);
             }
+        }
+    }
+
+    public sealed class ConfigChangeSignal : IDisposable
+    {
+        private readonly FileSystemWatcher watcher;
+        private long lastChangeUtcTicks;
+
+        public long LastChangeUtcTicks
+        {
+            get { return Interlocked.Read(ref lastChangeUtcTicks); }
+        }
+
+        public ConfigChangeSignal(string directory, string fileName)
+        {
+            watcher = new FileSystemWatcher(directory, fileName);
+            watcher.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.Size;
+            watcher.Changed += OnChanged;
+            watcher.Created += OnChanged;
+            watcher.Deleted += OnChanged;
+            watcher.Renamed += OnRenamed;
+            watcher.EnableRaisingEvents = true;
+        }
+
+        private void OnChanged(object sender, FileSystemEventArgs eventArgs)
+        {
+            Interlocked.Exchange(ref lastChangeUtcTicks, System.DateTime.UtcNow.Ticks);
+        }
+
+        private void OnRenamed(object sender, RenamedEventArgs eventArgs)
+        {
+            Interlocked.Exchange(ref lastChangeUtcTicks, System.DateTime.UtcNow.Ticks);
+        }
+
+        public void Dispose()
+        {
+            watcher.Dispose();
         }
     }
 }
@@ -395,8 +438,8 @@ namespace ScriptRunner
         $groups = [System.Collections.ArrayList]::new()
         $lookup = @{}
 
-        foreach ($item in $Items) {
-            $titleKey = [string]$item.title
+        foreach ($definition in $Items) {
+            $titleKey = [string]$definition.Item.title
             if (-not $lookup.ContainsKey($titleKey)) {
                 $group = [pscustomobject]@{
                     Name  = $titleKey
@@ -406,10 +449,113 @@ namespace ScriptRunner
                 $lookup[$titleKey] = $group
             }
 
-            $null = $lookup[$titleKey].Items.Add($item)
+            $null = $lookup[$titleKey].Items.Add($definition)
         }
 
         return $groups
+    }
+
+    function New-TaskDefinitions {
+        param(
+            [object[]]$Items,
+            [ValidateSet('Scheduled', 'Manual')]
+            [string]$Kind,
+            [hashtable]$SeenExplicitIds,
+            [hashtable]$SeenFallbackIds
+        )
+
+        $definitions = [System.Collections.ArrayList]::new()
+        foreach ($item in $Items) {
+            if ($null -eq $item -or $item -isnot [pscustomobject]) {
+                throw "$Kind 任务必须是 JSON 对象。"
+            }
+
+            $idProperty = $item.PSObject.Properties['id']
+            $explicitId = if ($idProperty) { ([string]$idProperty.Value).Trim() } else { '' }
+            if (-not [string]::IsNullOrWhiteSpace($explicitId)) {
+                $identity = "$Kind`nid:$explicitId"
+                if ($SeenExplicitIds.ContainsKey($identity)) {
+                    throw "$Kind 任务的 id '$explicitId' 重复。"
+                }
+                $SeenExplicitIds[$identity] = $true
+            } else {
+                $identityData = [ordered]@{
+                    Kind           = $Kind
+                    Title          = [string]$item.title
+                    DisplayName    = [string]$item.displayName
+                    StopDisplayName = [string]$item.stopDisplayName
+                    ScriptPath     = [string]$item.scriptPath
+                }
+                $identity = ConvertTo-Json -InputObject $identityData -Compress
+                $occurrence = 0
+                if ($SeenFallbackIds.ContainsKey($identity)) {
+                    $occurrence = [int]$SeenFallbackIds[$identity]
+                }
+                $SeenFallbackIds[$identity] = $occurrence + 1
+                $identity = "$identity`n$occurrence"
+            }
+
+            $sha256 = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                $digest = [Convert]::ToHexString(
+                    $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($identity))
+                ).Substring(0, 20)
+            } finally {
+                $sha256.Dispose()
+            }
+
+            $jobPrefix = if ($Kind -eq 'Scheduled') { 'ScheduledTask' } else { 'ManualTask' }
+            $null = $definitions.Add([pscustomobject]@{
+                Item    = $item
+                TaskKey = "$Kind`:$digest"
+                JobName = "${jobPrefix}_$digest"
+            })
+        }
+
+        return ,$definitions
+    }
+
+    function Read-ValidatedConfig {
+        param([string]$Path)
+
+        $config = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $config -or $config -isnot [pscustomobject]) {
+            throw '配置文件根节点必须是 JSON 对象。'
+        }
+
+        $globalUseBuiltInOutput = Get-OptionalBoolean -Object $config.ui -PropertyName 'useBuiltInOutput' -DefaultValue $false
+        $globalOutputEncoding = Get-OptionalOutputEncoding -Object $config.ui
+        if ($null -ne $globalOutputEncoding) {
+            $null = ConvertTo-TextEncoding -EncodingName $globalOutputEncoding
+        }
+
+        $longRunningItems = @()
+        $oneTimeItems = @()
+        if ($null -ne $config.longRunning) {
+            $longRunningItems = @($config.longRunning)
+        }
+        if ($null -ne $config.oneTime) {
+            $oneTimeItems = @($config.oneTime)
+        }
+        foreach ($item in $longRunningItems + $oneTimeItems) {
+            if ($null -eq $item -or $item -isnot [pscustomobject]) {
+                throw '每个任务配置都必须是 JSON 对象。'
+            }
+            $null = Get-OptionalBoolean -Object $item -PropertyName 'useBuiltInOutput' -DefaultValue $globalUseBuiltInOutput
+            $itemOutputEncoding = Get-OptionalOutputEncoding -Object $item
+            if ($null -ne $itemOutputEncoding) {
+                $null = ConvertTo-TextEncoding -EncodingName $itemOutputEncoding
+            }
+        }
+
+        $seenExplicitIds = @{}
+        $seenFallbackIds = @{}
+        return [pscustomobject]@{
+            UseBuiltInOutput = $globalUseBuiltInOutput
+            OutputEncoding   = $globalOutputEncoding
+            longRunning      = New-TaskDefinitions -Items $longRunningItems -Kind Scheduled -SeenExplicitIds $seenExplicitIds -SeenFallbackIds $seenFallbackIds
+            oneTime          = New-TaskDefinitions -Items $oneTimeItems -Kind Manual -SeenExplicitIds $seenExplicitIds -SeenFallbackIds $seenFallbackIds
+        }
     }
 
     function New-StandardButton {
@@ -448,10 +594,10 @@ namespace ScriptRunner
 
     function New-LongRunningGroup {
         param(
-            [psobject]$Item,
-            [int]$Index
+            [psobject]$Definition
         )
 
+        $item = $Definition.Item
         $groupBox = New-GroupBox -Header ([string]$Item.title)
         $panel = New-GroupPanel
 
@@ -471,9 +617,9 @@ namespace ScriptRunner
         $groupBox.Content = $panel
 
         $null = $SyncHash.ScheduledUi.Add([pscustomobject]@{
-            Index      = $Index
-            Item       = $Item
-            JobName    = "ScheduledTask$Index"
+            TaskKey     = $Definition.TaskKey
+            Item        = $item
+            JobName     = $Definition.JobName
             StartButton = $startButton
             StopButton  = $stopButton
             StatusText  = $statusText
@@ -493,14 +639,16 @@ namespace ScriptRunner
 
         foreach ($item in $Group.Items) {
             $currentIndex = $ButtonIndex.Value
-            $button = New-StandardButton -Content ([string]$item.displayName)
+            $button = New-StandardButton -Content ([string]$item.Item.displayName)
             [void]$panel.Children.Add($button)
 
+            $definition = $item
             $null = $SyncHash.ManualUi.Add([pscustomobject]@{
                 Index       = $currentIndex
-                Item        = $item
-                JobName     = "ManualTask$currentIndex"
-                Description = [string]$item.displayName
+                TaskKey     = $definition.TaskKey
+                Item        = $definition.Item
+                JobName     = $definition.JobName
+                Description = [string]$definition.Item.displayName
                 OutputTabKey = "ManualGroup:$($Group.Name)"
                 OutputTabLabel = [string]$Group.Name
                 Button      = $button
@@ -523,57 +671,58 @@ namespace ScriptRunner
 
     function Set-ScheduledState {
         param(
-            [int]$Index,
+            [string]$JobName,
             [bool]$IsRunning
         )
 
-        if ($Index -lt 0 -or $Index -ge $SyncHash.ScheduledUi.Count) {
-            return
+        foreach ($entry in $SyncHash.ScheduledUi) {
+            if ($entry.JobName -eq $JobName) {
+                $entry.StartButton.IsEnabled = -not $IsRunning
+                $entry.StopButton.IsEnabled = $IsRunning
+                $entry.StatusText.Text = if ($IsRunning) { '状态: 运行中' } else { '状态: 已停止' }
+                break
+            }
         }
-
-        $entry = $SyncHash.ScheduledUi[$Index]
-        if ($IsRunning) {
-            $entry.StartButton.IsEnabled = $false
-            $entry.StopButton.IsEnabled = $true
-            $entry.StatusText.Text = '状态: 运行中'
-            return
+        foreach ($entry in $SyncHash.RetiredUi) {
+            if ($entry.JobName -eq $JobName) {
+                $record = $SyncHash.JobRecords[$JobName]
+                $entry.StatusText.Text = if ($IsRunning) { '状态: 运行中' } elseif ($record) { $record.State } else { '状态: 已停止' }
+                $entry.StopButton.IsEnabled = $IsRunning
+                break
+            }
         }
-
-        $entry.StartButton.IsEnabled = $true
-        $entry.StopButton.IsEnabled = $false
-        $entry.StatusText.Text = '状态: 已停止'
-    }
-
-    function Get-ScheduledIndexFromJobName {
-        param([string]$JobName)
-
-        if ([string]::IsNullOrWhiteSpace($JobName)) {
-            return $null
-        }
-
-        $match = [regex]::Match($JobName, '\d+$')
-        if ($match.Success) {
-            return [int]$match.Value
-        }
-
-        return $null
     }
 
     function Invoke-ScheduledOnStart {
         param([string]$JobName)
 
-        $index = Get-ScheduledIndexFromJobName -JobName $JobName
-        if ($null -ne $index) {
-            Set-ScheduledState -Index $index -IsRunning $true
-        }
+        Set-ScheduledState -JobName $JobName -IsRunning $true
     }
 
     function Invoke-ScheduledOnExit {
         param([string]$JobName)
 
-        $index = Get-ScheduledIndexFromJobName -JobName $JobName
-        if ($null -ne $index) {
-            Set-ScheduledState -Index $index -IsRunning $false
+        Set-ScheduledState -JobName $JobName -IsRunning $false
+    }
+
+    function Set-JobRecordState {
+        param(
+            [string]$JobName,
+            [string]$State
+        )
+
+        if ($SyncHash.JobRecords.ContainsKey($JobName)) {
+            $SyncHash.JobRecords[$JobName].State = $State
+        }
+        foreach ($entry in $SyncHash.RetiredUi) {
+            if ($entry.JobName -eq $JobName) {
+                $entry.StatusText.Text = $State
+                $entry.StopButton.IsEnabled = $SyncHash.JobStates.ContainsKey($JobName)
+                break
+            }
+        }
+        if ($SyncHash.OperationsPanel) {
+            Update-RetiredJobsUi
         }
     }
 
@@ -583,6 +732,9 @@ namespace ScriptRunner
             [string]$ScriptPath,
             [string]$JobDescription,
             [psobject]$Item,
+            [string]$TaskKey,
+            [ValidateSet('Scheduled', 'Manual')]
+            [string]$TaskKind,
             [string]$OutputTabKey,
             [string]$OutputTabLabel,
             [scriptblock]$OnStart,
@@ -662,7 +814,7 @@ namespace ScriptRunner
                 }
 
                 $extension = [System.IO.Path]::GetExtension($processPath)
-                Initialize-OutputCaptureType
+                Initialize-UiHelperTypes
                 $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
                 $startInfo.UseShellExecute = $false
                 $startInfo.CreateNoWindow = $true
@@ -756,13 +908,25 @@ namespace ScriptRunner
             Process       = $process
             Description   = $JobDescription
             ProcessId     = $process.Id
-            Timer         = $null
+            TaskKey        = $TaskKey
+            TaskKind       = $TaskKind
+            Timer          = $null
             OnExit        = $OnExit
             OutputTab     = $outputTab
             OutputTabKey  = $OutputTabKey
             OutputTabLabel = $OutputTabLabel
             OutputTextBox = $outputTextBox
             OutputCapture = $outputCapture
+        }
+        $SyncHash.JobRecords[$JobName] = @{
+            JobName      = $JobName
+            TaskKey      = $TaskKey
+            TaskKind     = $TaskKind
+            Description  = $JobDescription
+            Item         = $Item
+            ProcessId    = $process.Id
+            StartedAt    = Get-Date
+            State        = '状态: 运行中'
         }
 
         if ($OnStart) {
@@ -799,6 +963,7 @@ namespace ScriptRunner
                 $exitCode = $jobState.Process.ExitCode
                 $sender.Stop()
                 $SyncHash.JobStates.Remove($jobName)
+                Set-JobRecordState -JobName $jobName -State "状态: 已结束 ($exitCode)"
                 if ($jobState.OutputTab) {
                     Set-OutputTabState -Tab $jobState.OutputTab -TabLabel $jobState.OutputTabLabel -Status "已结束 ($exitCode)" -CanClose $true
                 }
@@ -841,6 +1006,7 @@ namespace ScriptRunner
         }
 
         $SyncHash.JobStates.Remove($JobName)
+        Set-JobRecordState -JobName $JobName -State '状态: 已停止'
 
         Flush-JobOutput -JobState $job
         if ($job.OutputTab) {
@@ -885,12 +1051,119 @@ namespace ScriptRunner
             $onStart = { Set-ManualButtonsState -IsEnabled $false }
             $onExit = { Set-ManualButtonsState -IsEnabled $true }
 
-            if (-not (Start-ScriptJob -JobName $jobName -ScriptPath $scriptPath -JobDescription $description -Item $Entry.Item -OutputTabKey $outputTabKey -OutputTabLabel $outputTabLabel -OnStart $onStart -OnExit $onExit)) {
+            if (-not (Start-ScriptJob -JobName $jobName -ScriptPath $scriptPath -JobDescription $description -Item $Entry.Item -TaskKey $Entry.TaskKey -TaskKind Manual -OutputTabKey $outputTabKey -OutputTabLabel $outputTabLabel -OnStart $onStart -OnExit $onExit)) {
                 Set-ManualButtonsState -IsEnabled $true
             }
         }.GetNewClosure()
 
         $button.Add_Click($handler)
+    }
+
+    function Get-ConfiguredTaskKeys {
+        $keys = @{}
+        foreach ($definition in @($SyncHash.Config.longRunning) + @($SyncHash.Config.oneTime)) {
+            $keys[$definition.TaskKey] = $true
+        }
+        return $keys
+    }
+
+    function Update-RetiredJobsUi {
+        if ($SyncHash.RetiredGroupBox) {
+            [void]$SyncHash.OperationsPanel.Children.Remove($SyncHash.RetiredGroupBox)
+            $SyncHash.RetiredGroupBox = $null
+        }
+        $SyncHash.RetiredUi.Clear()
+        $configuredKeys = Get-ConfiguredTaskKeys
+        $retiredRecords = @(
+            $SyncHash.JobRecords.Values |
+                Where-Object { -not $configuredKeys.ContainsKey($_.TaskKey) -and $SyncHash.JobStates.ContainsKey($_.JobName) } |
+                Sort-Object StartedAt
+        )
+        if ($retiredRecords.Count -eq 0) {
+            return
+        }
+
+        $groupBox = New-GroupBox -Header '配置中已移除的任务'
+        $panel = [System.Windows.Controls.StackPanel]::new()
+        foreach ($record in $retiredRecords) {
+            $row = New-GroupPanel
+            $description = [System.Windows.Controls.TextBlock]::new()
+            $description.Text = "$($record.Description) (PID: $($record.ProcessId))"
+            $description.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+            $statusText = [System.Windows.Controls.TextBlock]::new()
+            $statusText.Text = $record.State
+            $statusText.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+            $statusText.Margin = [System.Windows.Thickness]::new(10, 0, 0, 0)
+            $stopButton = New-StandardButton -Content '停止'
+            $stopButton.IsEnabled = $SyncHash.JobStates.ContainsKey($record.JobName)
+            [void]$row.Children.Add($description)
+            [void]$row.Children.Add($statusText)
+            [void]$row.Children.Add($stopButton)
+            [void]$panel.Children.Add($row)
+
+            $entry = [pscustomobject]@{
+                JobName    = $record.JobName
+                StatusText = $statusText
+                StopButton = $stopButton
+            }
+            $null = $SyncHash.RetiredUi.Add($entry)
+            $jobName = $record.JobName
+            $stopButton.Add_Click({
+                Stop-ScriptJob -JobName $jobName | Out-Null
+            }.GetNewClosure())
+        }
+        $groupBox.Content = $panel
+        [void]$SyncHash.OperationsPanel.Children.Add($groupBox)
+        $SyncHash.RetiredGroupBox = $groupBox
+    }
+
+    function Register-ScheduledTaskHandlers {
+        foreach ($entry in $SyncHash.ScheduledUi) {
+            $scheduledEntry = $entry
+            $jobName = $scheduledEntry.JobName
+            $scheduledItem = $scheduledEntry.Item
+
+            $startHandler = {
+                $description = Get-DisplayDescription -Title ([string]$scheduledItem.title) -DisplayName ([string]$scheduledItem.displayName)
+                Start-ScriptJob -JobName $jobName -ScriptPath ([string]$scheduledItem.scriptPath) -JobDescription $description -Item $scheduledItem -TaskKey $scheduledEntry.TaskKey -TaskKind Scheduled -OnStart $SyncHash.ScheduledOnStartCallback -OnExit $SyncHash.ScheduledOnExitCallback | Out-Null
+            }.GetNewClosure()
+
+            $stopHandler = {
+                Stop-ScriptJob -JobName $jobName | Out-Null
+            }.GetNewClosure()
+
+            $scheduledEntry.StartButton.Add_Click($startHandler)
+            $scheduledEntry.StopButton.Add_Click($stopHandler)
+        }
+    }
+
+    function Update-OperationsUi {
+        $SyncHash.ScheduledUi.Clear()
+        $SyncHash.ManualUi.Clear()
+        $SyncHash.OperationsPanel.Children.Clear()
+
+        foreach ($definition in $SyncHash.Config.longRunning) {
+            $groupBox = New-LongRunningGroup -Definition $definition
+            [void]$SyncHash.OperationsPanel.Children.Add($groupBox)
+            $running = $SyncHash.JobStates.ContainsKey($definition.JobName)
+            Set-ScheduledState -JobName $definition.JobName -IsRunning $running
+        }
+
+        $oneTimeGroups = Get-OneTimeGroups -Items $SyncHash.Config.oneTime
+        $SyncHash.OneTimeGroups = $oneTimeGroups
+        $buttonIndex = 0
+        foreach ($group in $oneTimeGroups) {
+            $groupBox = New-OneTimeGroup -Group $group -ButtonIndex ([ref]$buttonIndex)
+            [void]$SyncHash.OperationsPanel.Children.Add($groupBox)
+        }
+
+        Register-ScheduledTaskHandlers
+        foreach ($entry in $SyncHash.ManualUi) {
+            Register-ManualRun -Entry $entry
+        }
+        $hasRunningManualJob = @($SyncHash.JobStates.Values | Where-Object TaskKind -eq 'Manual').Count -gt 0
+        Set-ManualButtonsState -IsEnabled (-not $hasRunningManualJob)
+        Update-RetiredJobsUi
     }
 
     function New-MainWindow {
@@ -913,21 +1186,8 @@ namespace ScriptRunner
         [void]$grid.RowDefinitions.Add($outputRow)
         $SyncHash.OutputRow = $outputRow
 
-        $oneTimeGroups = Get-OneTimeGroups -Items $SyncHash.Config.oneTime
-        $SyncHash.OneTimeGroups = $oneTimeGroups
-
         $operationsPanel = [System.Windows.Controls.StackPanel]::new()
-
-        for ($i = 0; $i -lt $SyncHash.Config.longRunning.Count; $i++) {
-            $groupBox = New-LongRunningGroup -Item $SyncHash.Config.longRunning[$i] -Index $i
-            [void]$operationsPanel.Children.Add($groupBox)
-        }
-
-        $buttonIndex = 0
-        foreach ($group in $oneTimeGroups) {
-            $groupBox = New-OneTimeGroup -Group $group -ButtonIndex ([ref]$buttonIndex)
-            [void]$operationsPanel.Children.Add($groupBox)
-        }
+        $SyncHash.OperationsPanel = $operationsPanel
 
         $operationsScroller = [System.Windows.Controls.ScrollViewer]::new()
         $operationsScroller.VerticalScrollBarVisibility = [System.Windows.Controls.ScrollBarVisibility]::Auto
@@ -942,6 +1202,7 @@ namespace ScriptRunner
         [System.Windows.Controls.Grid]::SetRow($operationsExpander, 0)
         [void]$grid.Children.Add($operationsExpander)
         $SyncHash.OperationsExpander = $operationsExpander
+        Update-OperationsUi
 
         $outputTabs = [System.Windows.Controls.TabControl]::new()
         $outputTabs.Margin = [System.Windows.Thickness]::new(0, 0, 0, 0)
@@ -973,89 +1234,77 @@ namespace ScriptRunner
     }
 
     try {
-        $config = Get-Content $configPath -Raw | ConvertFrom-Json
-        $globalUseBuiltInOutput = Get-OptionalBoolean -Object $config.ui -PropertyName 'useBuiltInOutput' -DefaultValue $false
-        $globalOutputEncoding = Get-OptionalOutputEncoding -Object $config.ui
-        if ($null -ne $globalOutputEncoding) {
-            $null = ConvertTo-TextEncoding -EncodingName $globalOutputEncoding
-        }
-
-        foreach ($item in @($config.longRunning) + @($config.oneTime)) {
-            $null = Get-OptionalBoolean -Object $item -PropertyName 'useBuiltInOutput' -DefaultValue $globalUseBuiltInOutput
-            $itemOutputEncoding = Get-OptionalOutputEncoding -Object $item
-            if ($null -ne $itemOutputEncoding) {
-                $null = ConvertTo-TextEncoding -EncodingName $itemOutputEncoding
-            }
-        }
+        $SyncHash.Config = Read-ValidatedConfig -Path $configPath
     } catch {
         Show-Message "读取配置文件失败: $_" ([System.Windows.MessageBoxImage]::Error)
         return
     }
 
-    $SyncHash.Config = [pscustomobject]@{
-        UseBuiltInOutput = $globalUseBuiltInOutput
-        OutputEncoding   = $globalOutputEncoding
-        longRunning      = @($config.longRunning)
-        oneTime          = @($config.oneTime)
-    }
-
-    $SyncHash.Form = New-MainWindow
-
-    $ScheduledOnStartCallback = {
+    $SyncHash.ScheduledOnStartCallback = {
         param($JobName)
         Invoke-ScheduledOnStart -JobName $JobName
     }
 
-    $ScheduledOnExitCallback = {
+    $SyncHash.ScheduledOnExitCallback = {
         param($JobName)
         Invoke-ScheduledOnExit -JobName $JobName
     }
 
+    $SyncHash.Form = New-MainWindow
+
     # 添加窗口 Loaded 事件处理程序
     $SyncHash.Form.Add_Loaded({
-        foreach ($entry in $SyncHash.ScheduledUi) {
-            if ($entry.Item.autoStart) {
-                $description = Get-DisplayDescription -Title ([string]$entry.Item.title) -DisplayName ([string]$entry.Item.displayName)
-                Start-ScriptJob -JobName $entry.JobName -ScriptPath ([string]$entry.Item.scriptPath) -JobDescription $description -Item $entry.Item -OnStart $ScheduledOnStartCallback -OnExit $ScheduledOnExitCallback | Out-Null
+        foreach ($definition in $SyncHash.Config.longRunning) {
+            if ($definition.Item.autoStart) {
+                $description = Get-DisplayDescription -Title ([string]$definition.Item.title) -DisplayName ([string]$definition.Item.displayName)
+                Start-ScriptJob -JobName $definition.JobName -ScriptPath ([string]$definition.Item.scriptPath) -JobDescription $description -Item $definition.Item -TaskKey $definition.TaskKey -TaskKind Scheduled -OnStart $SyncHash.ScheduledOnStartCallback -OnExit $SyncHash.ScheduledOnExitCallback | Out-Null
             }
         }
     })
 
-    # 注册定时任务按钮
-    foreach ($entry in $SyncHash.ScheduledUi) {
-        $index = $entry.Index
-        $jobName = $entry.JobName
-        $scheduledItem = $entry.Item
-        $startButton = $entry.StartButton
-        $stopButton = $entry.StopButton
+    try {
+        Initialize-UiHelperTypes
+        $configDirectory = [System.IO.Path]::GetDirectoryName($configPath)
+        $configFileName = [System.IO.Path]::GetFileName($configPath)
+        $watcher = [ScriptRunner.ConfigChangeSignal]::new($configDirectory, $configFileName)
+        $SyncHash.ConfigWatcher = $watcher
 
-        $startHandler = {
-            $description = Get-DisplayDescription -Title ([string]$scheduledItem.title) -DisplayName ([string]$scheduledItem.displayName)
-            Start-ScriptJob -JobName $jobName -ScriptPath ([string]$scheduledItem.scriptPath) -JobDescription $description -Item $scheduledItem -OnStart $ScheduledOnStartCallback -OnExit $ScheduledOnExitCallback | Out-Null
-        }.GetNewClosure()
-
-        $stopHandler = {
-            if (Stop-ScriptJob -JobName $jobName) {
-                Set-ScheduledState -Index $index -IsRunning $false
+        $configRefreshTimer = [System.Windows.Threading.DispatcherTimer]::new()
+        $configRefreshTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+        $configRefreshTimer.add_Tick({
+            $changeTicks = $SyncHash.ConfigWatcher.LastChangeUtcTicks
+            if ($changeTicks -le $SyncHash.ConfigLastProcessedUtcTicks) {
+                return
             }
-        }.GetNewClosure()
+            if (([DateTime]::UtcNow.Ticks - $changeTicks) -lt [TimeSpan]::FromMilliseconds(500).Ticks) {
+                return
+            }
 
-        $startButton.Add_Click($startHandler)
-        $stopButton.Add_Click($stopHandler)
-    }
-
-    # 注册手动执行按钮
-    foreach ($entry in $SyncHash.ManualUi) {
-        Register-ManualRun -Entry $entry
+            $SyncHash.ConfigLastProcessedUtcTicks = $changeTicks
+            try {
+                $newConfig = Read-ValidatedConfig -Path $configPath
+                $SyncHash.Config = $newConfig
+                Update-OperationsUi
+            } catch {
+                Show-Message "热更新配置失败，仍保留上一次有效配置: $_" ([System.Windows.MessageBoxImage]::Error)
+            }
+        })
+        $configRefreshTimer.Start()
+        $SyncHash.ConfigRefreshTimer = $configRefreshTimer
+    } catch {
+        Show-Message "无法监听配置文件变更: $_" ([System.Windows.MessageBoxImage]::Error)
+        return
     }
 
     # 窗口关闭事件
     $SyncHash.Form.Add_Closing({
-        foreach ($entry in $SyncHash.ScheduledUi) {
-            if ($SyncHash.JobStates.ContainsKey($entry.JobName)) {
-                Stop-ScriptJob -JobName $entry.JobName | Out-Null
-            }
+        if ($SyncHash.ConfigRefreshTimer) {
+            $SyncHash.ConfigRefreshTimer.Stop()
         }
+        if ($SyncHash.ConfigWatcher) {
+            $SyncHash.ConfigWatcher.Dispose()
+        }
+        Stop-AllTrackedJobs
     })
 
     # 显示窗口
