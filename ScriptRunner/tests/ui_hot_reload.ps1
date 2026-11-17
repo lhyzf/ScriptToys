@@ -87,6 +87,9 @@ try {
     $SyncHash.ScheduledOnStartCallback = { param($JobName) Invoke-ScheduledOnStart -JobName $JobName }
     $SyncHash.ScheduledOnExitCallback = { param($JobName) Invoke-ScheduledOnExit -JobName $JobName }
     $SyncHash.Form = New-MainWindow
+    if ($SyncHash.Form.ThemeMode -ne [System.Windows.ThemeMode]::System) {
+        throw 'Main window is not following the system theme'
+    }
     $watcher = [ScriptRunner.ConfigChangeSignal]::new($directory, 'functions.ps1')
     $SyncHash.UiFunctionsWatcher = $watcher
 

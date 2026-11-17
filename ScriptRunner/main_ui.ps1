@@ -202,7 +202,7 @@ namespace ScriptRunner
         $window = [System.Windows.Window]::new()
         $window.Title = '脚本执行器'
         $window.SizeToContent = [System.Windows.SizeToContent]::Manual
-        $window.Background = [System.Windows.Media.Brushes]::White
+        $window.ThemeMode = [System.Windows.ThemeMode]::System
 
         $grid = [System.Windows.Controls.Grid]::new()
         $grid.Margin = [System.Windows.Thickness]::new(10)
