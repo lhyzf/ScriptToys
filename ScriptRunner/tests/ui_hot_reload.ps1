@@ -125,25 +125,45 @@ try {
         $toggleButton.Template -ne $manualButton.Template) {
         throw 'Long-running task did not retain the active theme style and template'
     }
+    $lightPalette = Get-ScheduledTogglePalette -Button $toggleButton
+    $lightStoppedColor = [System.Windows.Media.BrushConverter]::new().ConvertFromString($lightPalette.Stopped).ToString()
+    $lightStoppedHoverColor = [System.Windows.Media.BrushConverter]::new().ConvertFromString($lightPalette.StoppedHover).ToString()
+    $lightStoppedPressedColor = [System.Windows.Media.BrushConverter]::new().ConvertFromString($lightPalette.StoppedPressed).ToString()
     $startBorder = $toggleButton.Resources['ScriptRunner.Toggle.BackgroundElement']
     if ($null -eq $startBorder -or
         $startBorder -isnot [System.Windows.Controls.Border] -or
-        $toggleButton.Background.ToString() -ne '#FFDCEBDD' -or
-        $startBorder.Background.ToString() -ne '#FFDCEBDD' -or
-        $toggleButton.Resources['ScriptRunner.Toggle.HoverBackground'].ToString() -ne '#FFC6DFC9' -or
-        $toggleButton.Resources['ScriptRunner.Toggle.PressedBackground'].ToString() -ne '#FFB0D1B5' -or
-        $toggleButton.Resources['ScriptRunner.Toggle.StateListeners'].Count -ne 2) {
+        $toggleButton.Background.ToString() -ne $lightStoppedColor -or
+        $startBorder.Background.ToString() -ne $lightStoppedColor -or
+        $toggleButton.Resources['ScriptRunner.Toggle.HoverBackground'].ToString() -ne $lightStoppedHoverColor -or
+        $toggleButton.Resources['ScriptRunner.Toggle.PressedBackground'].ToString() -ne $lightStoppedPressedColor -or
+        $toggleButton.Resources['ScriptRunner.Toggle.StateListeners'].Count -ne 3) {
         throw 'Start button background, hover, or pressed colors are incorrect'
     }
     Set-ScheduledToggleBackground -Button $toggleButton -InteractionState Hover
-    if ($startBorder.Background.ToString() -ne '#FFC6DFC9') {
+    if ($startBorder.Background.ToString() -ne $lightStoppedHoverColor) {
         throw 'Start button hover background is incorrect'
     }
     Set-ScheduledToggleBackground -Button $toggleButton -InteractionState Pressed
-    if ($startBorder.Background.ToString() -ne '#FFB0D1B5') {
+    if ($startBorder.Background.ToString() -ne $lightStoppedPressedColor) {
         throw 'Start button pressed background is incorrect'
     }
     Set-ScheduledToggleBackground -Button $toggleButton
+    $themeForeground = $toggleButton.Foreground
+    $toggleButton.Foreground = [System.Windows.Media.Brushes]::White
+    $darkPalette = Get-ScheduledTogglePalette -Button $toggleButton
+    $darkStoppedColor = [System.Windows.Media.BrushConverter]::new().ConvertFromString($darkPalette.Stopped).ToString()
+    $darkStoppedHoverColor = [System.Windows.Media.BrushConverter]::new().ConvertFromString($darkPalette.StoppedHover).ToString()
+    $darkStoppedPressedColor = [System.Windows.Media.BrushConverter]::new().ConvertFromString($darkPalette.StoppedPressed).ToString()
+    if ($toggleButton.Background.ToString() -ne $darkStoppedColor -or
+        $darkPalette.Stopped -eq $lightPalette.Stopped -or
+        $toggleButton.Resources['ScriptRunner.Toggle.HoverBackground'].ToString() -ne $darkStoppedHoverColor -or
+        $toggleButton.Resources['ScriptRunner.Toggle.PressedBackground'].ToString() -ne $darkStoppedPressedColor) {
+        throw 'Button did not switch to a dark-theme palette when its theme foreground changed'
+    }
+    $toggleButton.Foreground = $themeForeground
+    if ($toggleButton.Background.ToString() -ne $lightStoppedColor) {
+        throw 'Button did not restore its palette when the theme foreground changed back'
+    }
     $watcher = [ScriptRunner.ConfigChangeSignal]::new($uiDirectory, '*.ps1')
     $SyncHash.UiFunctionsWatcher = $watcher
     $uiFunctionsDirectory = $uiDirectory
@@ -218,10 +238,10 @@ try {
         -not [object]::ReferenceEquals($job.OutputTab, $outputTab) -or
         $SyncHash.ScheduledUi[0].ToggleButton.Content -ne 'stop' -or
         $SyncHash.ScheduledUi[0].ToggleButton.Tag -ne 'Running' -or
-        $SyncHash.ScheduledUi[0].ToggleButton.Background.ToString() -ne '#FFF0DDDD' -or
-        $startBorder.Background.ToString() -ne '#FFF0DDDD' -or
-        $SyncHash.ScheduledUi[0].ToggleButton.Resources['ScriptRunner.Toggle.HoverBackground'].ToString() -ne '#FFE4C5C5' -or
-        $SyncHash.ScheduledUi[0].ToggleButton.Resources['ScriptRunner.Toggle.PressedBackground'].ToString() -ne '#FFD6AAAA') {
+        $SyncHash.ScheduledUi[0].ToggleButton.Background.ToString() -ne ([System.Windows.Media.BrushConverter]::new().ConvertFromString($lightPalette.Running).ToString()) -or
+        $startBorder.Background.ToString() -ne ([System.Windows.Media.BrushConverter]::new().ConvertFromString($lightPalette.Running).ToString()) -or
+        $SyncHash.ScheduledUi[0].ToggleButton.Resources['ScriptRunner.Toggle.HoverBackground'].ToString() -ne ([System.Windows.Media.BrushConverter]::new().ConvertFromString($lightPalette.RunningHover).ToString()) -or
+        $SyncHash.ScheduledUi[0].ToggleButton.Resources['ScriptRunner.Toggle.PressedBackground'].ToString() -ne ([System.Windows.Media.BrushConverter]::new().ConvertFromString($lightPalette.RunningPressed).ToString())) {
         throw 'Reload did not preserve the running job, output tab, or button state'
     }
 

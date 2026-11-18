@@ -1,3 +1,41 @@
+function Get-ScheduledTogglePalette {
+    param([System.Windows.Controls.Button]$Button)
+
+    $foreground = $Button.Foreground
+    if ($foreground -isnot [System.Windows.Media.SolidColorBrush]) {
+        throw '无法从按钮前景色判断系统主题。'
+    }
+
+    $color = $foreground.Color
+    $red = [double]$color.R / 255
+    $green = [double]$color.G / 255
+    $blue = [double]$color.B / 255
+    $red = if ($red -le 0.04045) { $red / 12.92 } else { [Math]::Pow(($red + 0.055) / 1.055, 2.4) }
+    $green = if ($green -le 0.04045) { $green / 12.92 } else { [Math]::Pow(($green + 0.055) / 1.055, 2.4) }
+    $blue = if ($blue -le 0.04045) { $blue / 12.92 } else { [Math]::Pow(($blue + 0.055) / 1.055, 2.4) }
+    $luminance = (0.2126 * $red) + (0.7152 * $green) + (0.0722 * $blue)
+
+    if ($luminance -ge 0.5) {
+        return @{
+            Stopped = '#2E6B45'
+            StoppedHover = '#3A8054'
+            StoppedPressed = '#245638'
+            Running = '#7A3535'
+            RunningHover = '#924646'
+            RunningPressed = '#682C2C'
+        }
+    }
+
+    return @{
+        Stopped = '#DCEBDD'
+        StoppedHover = '#C6DFC9'
+        StoppedPressed = '#B0D1B5'
+        Running = '#F0DDDD'
+        RunningHover = '#E4C5C5'
+        RunningPressed = '#D6AAAA'
+    }
+}
+
 function Set-ScheduledToggleVisualState {
     param(
         [System.Windows.Controls.Button]$Button,
@@ -5,15 +43,11 @@ function Set-ScheduledToggleVisualState {
     )
 
     $Button.Tag = if ($IsRunning) { 'Running' } else { 'Stopped' }
-    if ($IsRunning) {
-        $Button.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#F0DDDD')
-        $Button.Resources['ScriptRunner.Toggle.HoverBackground'] = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#E4C5C5')
-        $Button.Resources['ScriptRunner.Toggle.PressedBackground'] = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#D6AAAA')
-    } else {
-        $Button.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#DCEBDD')
-        $Button.Resources['ScriptRunner.Toggle.HoverBackground'] = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#C6DFC9')
-        $Button.Resources['ScriptRunner.Toggle.PressedBackground'] = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#B0D1B5')
-    }
+    $palette = Get-ScheduledTogglePalette -Button $Button
+    $state = if ($IsRunning) { 'Running' } else { 'Stopped' }
+    $Button.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString($palette[$state])
+    $Button.Resources['ScriptRunner.Toggle.HoverBackground'] = [System.Windows.Media.BrushConverter]::new().ConvertFromString($palette["${state}Hover"])
+    $Button.Resources['ScriptRunner.Toggle.PressedBackground'] = [System.Windows.Media.BrushConverter]::new().ConvertFromString($palette["${state}Pressed"])
     Set-ScheduledToggleBackground -Button $Button
 }
 
@@ -98,12 +132,18 @@ function Initialize-ScheduledToggleBackground {
     $listeners = [System.Collections.ArrayList]::new()
     foreach ($property in @(
         [System.Windows.UIElement]::IsMouseOverProperty,
-        [System.Windows.Controls.Primitives.ButtonBase]::IsPressedProperty
+        [System.Windows.Controls.Primitives.ButtonBase]::IsPressedProperty,
+        [System.Windows.Controls.Control]::ForegroundProperty
     )) {
         $descriptor = [System.ComponentModel.DependencyPropertyDescriptor]::FromProperty($property, $Button.GetType())
         $buttonForState = $Button
+        $propertyForState = $property
         $handler = [System.EventHandler]{
-            Set-ScheduledToggleBackground -Button $buttonForState
+            if ($propertyForState -eq [System.Windows.Controls.Control]::ForegroundProperty) {
+                Set-ScheduledToggleVisualState -Button $buttonForState -IsRunning ($buttonForState.Tag -eq 'Running')
+            } else {
+                Set-ScheduledToggleBackground -Button $buttonForState
+            }
         }.GetNewClosure()
         $descriptor.AddValueChanged($Button, $handler)
         [void]$listeners.Add([pscustomobject]@{
@@ -112,7 +152,7 @@ function Initialize-ScheduledToggleBackground {
         })
     }
     $Button.Resources[$listenersKey] = $listeners
-    Set-ScheduledToggleBackground -Button $Button
+    Set-ScheduledToggleVisualState -Button $Button -IsRunning ($Button.Tag -eq 'Running')
 
     $unloadedHandlerKey = 'ScriptRunner.Toggle.UnloadedHandler'
     if (-not $Button.Resources.Contains($unloadedHandlerKey)) {
