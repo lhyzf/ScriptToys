@@ -56,6 +56,7 @@ $jobPath = Join-Path $directory 'job.ps1'
 $configPath = Join-Path $directory 'config.json'
 $timer = $null
 $watcher = $null
+$windowShown = $false
 $SyncHash = @{
     Host = $host
     ScriptRoot = $directory
@@ -77,7 +78,7 @@ try {
     $config = @{
         ui = @{ useBuiltInOutput = $true }
         longRunning = @(@{ id = 'test'; title = 'test'; displayName = 'start'; stopDisplayName = 'stop'; scriptPath = $jobPath })
-        oneTime = @()
+        oneTime = @(@{ id = 'manual'; title = 'manual'; displayName = 'manual'; scriptPath = $jobPath })
     } | ConvertTo-Json -Depth 5
     [System.IO.File]::WriteAllText($configPath, $config)
 
@@ -90,6 +91,45 @@ try {
     if ($SyncHash.Form.ThemeMode -ne [System.Windows.ThemeMode]::System) {
         throw 'Main window is not following the system theme'
     }
+    $SyncHash.Form.ShowInTaskbar = $false
+    $SyncHash.Form.WindowStyle = [System.Windows.WindowStyle]::None
+    $SyncHash.Form.Opacity = 0
+    $SyncHash.Form.Left = -10000
+    $SyncHash.Form.Top = -10000
+    $SyncHash.Form.Show()
+    $windowShown = $true
+    Wait-TestCondition { $SyncHash.ScheduledUi[0].ToggleButton.IsLoaded } 'scheduled toggle visual initialization'
+
+    $scheduledPanel = $SyncHash.ScheduledUi[0].ToggleButton.Parent
+    $scheduledButtons = @($scheduledPanel.Children | Where-Object { $_ -is [System.Windows.Controls.Button] })
+    $toggleButton = $SyncHash.ScheduledUi[0].ToggleButton
+    $manualButton = $SyncHash.ManualUi[0].Button
+    if ($scheduledButtons.Count -ne 1 -or
+        $toggleButton.Content -ne 'start' -or
+        $toggleButton.ReadLocalValue([System.Windows.FrameworkElement]::StyleProperty) -ne [System.Windows.DependencyProperty]::UnsetValue -or
+        $toggleButton.ReadLocalValue([System.Windows.Controls.Control]::TemplateProperty) -ne [System.Windows.DependencyProperty]::UnsetValue -or
+        $toggleButton.Template -ne $manualButton.Template) {
+        throw 'Long-running task did not retain the active theme style and template'
+    }
+    $startBorder = $toggleButton.Resources['ScriptRunner.Toggle.BackgroundElement']
+    if ($null -eq $startBorder -or
+        $startBorder -isnot [System.Windows.Controls.Border] -or
+        $toggleButton.Background.ToString() -ne '#FFDCEBDD' -or
+        $startBorder.Background.ToString() -ne '#FFDCEBDD' -or
+        $toggleButton.Resources['ScriptRunner.Toggle.HoverBackground'].ToString() -ne '#FFC6DFC9' -or
+        $toggleButton.Resources['ScriptRunner.Toggle.PressedBackground'].ToString() -ne '#FFB0D1B5' -or
+        $toggleButton.Resources['ScriptRunner.Toggle.StateListeners'].Count -ne 2) {
+        throw 'Start button background, hover, or pressed colors are incorrect'
+    }
+    Set-ScheduledToggleBackground -Button $toggleButton -InteractionState Hover
+    if ($startBorder.Background.ToString() -ne '#FFC6DFC9') {
+        throw 'Start button hover background is incorrect'
+    }
+    Set-ScheduledToggleBackground -Button $toggleButton -InteractionState Pressed
+    if ($startBorder.Background.ToString() -ne '#FFB0D1B5') {
+        throw 'Start button pressed background is incorrect'
+    }
+    Set-ScheduledToggleBackground -Button $toggleButton
     $watcher = [ScriptRunner.ConfigChangeSignal]::new($directory, 'functions.ps1')
     $SyncHash.UiFunctionsWatcher = $watcher
 
@@ -117,17 +157,22 @@ try {
     $updated = $source.Replace('$button.Height = 25', '$button.Height = 42').Replace('$TextBox.AppendText($Line + [Environment]::NewLine)', '$TextBox.AppendText("updated: " + $Line + [Environment]::NewLine)')
     if ($updated -ceq $source) { throw 'Test replacements did not match' }
     [System.IO.File]::WriteAllText($uiFunctionsPath, $updated)
-    Wait-TestCondition { $SyncHash.ScheduledUi[0].StartButton.Height -eq 42 -and $job.OutputTextBox.Text.Contains('updated: tick') } 'automatic reload and active job output'
+    Wait-TestCondition { $SyncHash.ScheduledUi[0].ToggleButton.Height -eq 42 -and $job.OutputTextBox.Text.Contains('updated: tick') } 'automatic reload and active job output'
     if ($job.Process.HasExited -or $job.ProcessId -ne $pidBefore -or
         -not [object]::ReferenceEquals($job.OutputTab, $outputTab) -or
-        $SyncHash.ScheduledUi[0].StartButton.IsEnabled -or -not $SyncHash.ScheduledUi[0].StopButton.IsEnabled) {
+        $SyncHash.ScheduledUi[0].ToggleButton.Content -ne 'stop' -or
+        $SyncHash.ScheduledUi[0].ToggleButton.Tag -ne 'Running' -or
+        $SyncHash.ScheduledUi[0].ToggleButton.Background.ToString() -ne '#FFF0DDDD' -or
+        $startBorder.Background.ToString() -ne '#FFF0DDDD' -or
+        $SyncHash.ScheduledUi[0].ToggleButton.Resources['ScriptRunner.Toggle.HoverBackground'].ToString() -ne '#FFE4C5C5' -or
+        $SyncHash.ScheduledUi[0].ToggleButton.Resources['ScriptRunner.Toggle.PressedBackground'].ToString() -ne '#FFD6AAAA') {
         throw 'Reload did not preserve the running job, output tab, or button state'
     }
 
-    $previousControl = $SyncHash.ScheduledUi[0].StartButton
+    $previousControl = $SyncHash.ScheduledUi[0].ToggleButton
     [System.IO.File]::WriteAllText($uiFunctionsPath, $updated + "`nfunction Invalid {")
     Wait-TestCondition { $SyncHash.TestMessages.Count -ge 1 } 'syntax error notification'
-    if (-not [object]::ReferenceEquals($previousControl, $SyncHash.ScheduledUi[0].StartButton) -or
+    if (-not [object]::ReferenceEquals($previousControl, $SyncHash.ScheduledUi[0].ToggleButton) -or
         (New-StandardButton 'check').Height -ne 42 -or $job.Process.HasExited) {
         throw 'Syntax error did not preserve the previous UI and job'
     }
@@ -135,7 +180,7 @@ try {
     $broken = (Replace-TestFunction $updated 'New-StandardButton' "function New-StandardButton { throw 'refresh failure' }") + "`nfunction Test-NewHelper { 'new' }"
     [System.IO.File]::WriteAllText($uiFunctionsPath, $broken)
     Wait-TestCondition { $SyncHash.TestMessages.Count -ge 2 } 'refresh error notification'
-    if (-not [object]::ReferenceEquals($previousControl, $SyncHash.ScheduledUi[0].StartButton) -or
+    if (-not [object]::ReferenceEquals($previousControl, $SyncHash.ScheduledUi[0].ToggleButton) -or
         (New-StandardButton 'check').Height -ne 42 -or $job.Process.HasExited -or
         (Get-Command Test-NewHelper -CommandType Function -ErrorAction SilentlyContinue)) {
         throw 'Refresh failure did not restore the previous UI, methods, and job'
@@ -144,27 +189,34 @@ try {
     $removed = Replace-TestFunction $updated 'Get-UseBuiltInOutput' ''
     [System.IO.File]::WriteAllText($uiFunctionsPath, $removed)
     Wait-TestCondition { $SyncHash.TestMessages.Count -ge 3 } 'removed function notification'
-    if (-not [object]::ReferenceEquals($previousControl, $SyncHash.ScheduledUi[0].StartButton) -or
+    if (-not [object]::ReferenceEquals($previousControl, $SyncHash.ScheduledUi[0].ToggleButton) -or
         -not (Get-Command Get-UseBuiltInOutput -CommandType Function -ErrorAction SilentlyContinue)) {
         throw 'Removing a loaded function was not rejected'
     }
 
     [System.IO.File]::Delete($uiFunctionsPath)
     Wait-TestCondition { $SyncHash.TestMessages.Count -ge 4 } 'deleted file notification'
-    if (-not [object]::ReferenceEquals($previousControl, $SyncHash.ScheduledUi[0].StartButton) -or $job.Process.HasExited) {
+    if (-not [object]::ReferenceEquals($previousControl, $SyncHash.ScheduledUi[0].ToggleButton) -or $job.Process.HasExited) {
         throw 'Deleting the method file did not preserve the previous UI and job'
     }
 
     [System.IO.File]::WriteAllText($uiFunctionsPath, $source)
-    Wait-TestCondition { $SyncHash.ScheduledUi[0].StartButton.Height -eq 25 } 'recovery after failure'
-    $SyncHash.ScheduledUi[0].StopButton.RaiseEvent(
+    Wait-TestCondition { $SyncHash.ScheduledUi[0].ToggleButton.Height -eq 25 } 'recovery after failure'
+    $SyncHash.ScheduledUi[0].ToggleButton.RaiseEvent(
         [System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)
     )
-    if ($SyncHash.JobStates.ContainsKey($definition.JobName)) { throw 'Rebuilt stop button did not stop the job' }
-    'PASS: automatic reload, active job and output, rollback, removal, recovery, rebuilt event handler'
+    if ($SyncHash.JobStates.ContainsKey($definition.JobName) -or
+        $SyncHash.ScheduledUi[0].ToggleButton.Content -ne 'start' -or
+        $SyncHash.ScheduledUi[0].ToggleButton.Tag -ne 'Stopped') {
+        throw 'Rebuilt toggle button did not stop the job and return to the start state'
+    }
+    'PASS: native button template, state backgrounds, hover/pressed colors, automatic reload, active job and output, rollback, removal, recovery'
 } finally {
     if ($timer) { $timer.Stop() }
     if ($watcher) { $watcher.Dispose() }
+    if ($windowShown -and $SyncHash.Form -and $SyncHash.Form.IsVisible) {
+        $SyncHash.Form.Close()
+    }
     foreach ($job in @($SyncHash.JobStates.Values)) {
         if ($job.Timer) { $job.Timer.Stop() }
         if ($job.Process) {
