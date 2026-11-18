@@ -97,6 +97,14 @@ try {
     if ($SyncHash.Form.ThemeMode -ne [System.Windows.ThemeMode]::System) {
         throw 'Main window is not following the system theme'
     }
+    if ($SyncHash.Form.Content.RowDefinitions.Count -ne 3 -or
+        [System.Windows.Controls.Grid]::GetRow($SyncHash.PanelSplitter) -ne 1 -or
+        [System.Windows.Controls.Grid]::GetRow($SyncHash.OutputTabs) -ne 2 -or
+        $SyncHash.PanelSplitter.ResizeDirection -ne [System.Windows.Controls.GridResizeDirection]::Rows -or
+        $SyncHash.PanelSplitter.ResizeBehavior -ne [System.Windows.Controls.GridResizeBehavior]::PreviousAndNext -or
+        $SyncHash.PanelSplitter.Visibility -ne [System.Windows.Visibility]::Collapsed) {
+        throw 'Panel splitter is not configured between the operations and output panels'
+    }
     $SyncHash.Form.ShowInTaskbar = $false
     $SyncHash.Form.WindowStyle = [System.Windows.WindowStyle]::None
     $SyncHash.Form.Opacity = 0
@@ -160,6 +168,17 @@ try {
     $pidBefore = $job.ProcessId
     $outputTab = $job.OutputTab
     Wait-TestCondition { $job.OutputTextBox.Text.Contains('tick') } 'initial job output'
+    if ($SyncHash.PanelSplitter.Visibility -ne [System.Windows.Visibility]::Visible) {
+        throw 'Panel splitter was not shown with the output panel'
+    }
+    $SyncHash.OperationsExpander.IsExpanded = $false
+    if ($SyncHash.PanelSplitter.Visibility -ne [System.Windows.Visibility]::Collapsed) {
+        throw 'Panel splitter should be hidden when the operations panel is collapsed'
+    }
+    $SyncHash.OperationsExpander.IsExpanded = $true
+    if ($SyncHash.PanelSplitter.Visibility -ne [System.Windows.Visibility]::Visible) {
+        throw 'Panel splitter was not restored when the operations panel expanded'
+    }
 
     [System.IO.File]::WriteAllText($customControlPath, "function New-TestControl { 'loaded' }")
     Wait-TestCondition {

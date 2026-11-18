@@ -125,15 +125,20 @@ function Set-OutputTabsVisible {
     if ($IsVisible) {
         if ($SyncHash.OperationsExpander.IsExpanded) {
             $SyncHash.OperationsRow.Height = [System.Windows.GridLength]::new(2, [System.Windows.GridUnitType]::Star)
+            $SyncHash.PanelSplitter.Visibility = [System.Windows.Visibility]::Visible
         } else {
             $SyncHash.OperationsRow.Height = [System.Windows.GridLength]::Auto
+            $SyncHash.PanelSplitter.Visibility = [System.Windows.Visibility]::Collapsed
         }
+        $SyncHash.SplitterRow.Height = [System.Windows.GridLength]::Auto
         $SyncHash.OutputRow.Height = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
         $SyncHash.OutputTabs.Visibility = [System.Windows.Visibility]::Visible
         return
     }
 
     $SyncHash.OutputTabs.Visibility = [System.Windows.Visibility]::Collapsed
+    $SyncHash.PanelSplitter.Visibility = [System.Windows.Visibility]::Collapsed
+    $SyncHash.SplitterRow.Height = [System.Windows.GridLength]::Auto
     $SyncHash.OutputRow.Height = [System.Windows.GridLength]::Auto
     $SyncHash.OperationsRow.Height = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
 }

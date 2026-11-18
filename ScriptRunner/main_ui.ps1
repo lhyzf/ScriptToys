@@ -219,6 +219,11 @@ namespace ScriptRunner
         [void]$grid.RowDefinitions.Add($operationsRow)
         $SyncHash.OperationsRow = $operationsRow
 
+        $splitterRow = [System.Windows.Controls.RowDefinition]::new()
+        $splitterRow.Height = [System.Windows.GridLength]::Auto
+        [void]$grid.RowDefinitions.Add($splitterRow)
+        $SyncHash.SplitterRow = $splitterRow
+
         $outputRow = [System.Windows.Controls.RowDefinition]::new()
         $outputRow.Height = [System.Windows.GridLength]::Auto
         [void]$grid.RowDefinitions.Add($outputRow)
@@ -242,10 +247,20 @@ namespace ScriptRunner
         $SyncHash.OperationsExpander = $operationsExpander
         Update-OperationsUi
 
+        $panelSplitter = [System.Windows.Controls.GridSplitter]::new()
+        $panelSplitter.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Stretch
+        $panelSplitter.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+        $panelSplitter.ResizeDirection = [System.Windows.Controls.GridResizeDirection]::Rows
+        $panelSplitter.ResizeBehavior = [System.Windows.Controls.GridResizeBehavior]::PreviousAndNext
+        $panelSplitter.Visibility = [System.Windows.Visibility]::Collapsed
+        [System.Windows.Controls.Grid]::SetRow($panelSplitter, 1)
+        [void]$grid.Children.Add($panelSplitter)
+        $SyncHash.PanelSplitter = $panelSplitter
+
         $outputTabs = [System.Windows.Controls.TabControl]::new()
         $outputTabs.Margin = [System.Windows.Thickness]::new(0, 0, 0, 0)
         $outputTabs.Visibility = [System.Windows.Visibility]::Collapsed
-        [System.Windows.Controls.Grid]::SetRow($outputTabs, 1)
+        [System.Windows.Controls.Grid]::SetRow($outputTabs, 2)
         [void]$grid.Children.Add($outputTabs)
         $SyncHash.OutputTabs = $outputTabs
         $operationsExpander.Add_Expanded({
