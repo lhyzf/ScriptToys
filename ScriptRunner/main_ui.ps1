@@ -109,39 +109,45 @@ namespace ScriptRunner
     }
 
     function Import-UiFunctions {
-        param([string]$Path, [switch]$Refresh)
+        param([string]$Directory, [switch]$Refresh)
 
         $ErrorActionPreference = 'Stop'
-        $source = [System.IO.File]::ReadAllText($Path)
-        $tokens = $null
-        $parseErrors = $null
-        $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, $Path, [ref]$tokens, [ref]$parseErrors)
-        if ($parseErrors.Count -gt 0) {
-            throw ($parseErrors | ForEach-Object { $_.ToString() } | Out-String)
+        $files = @(Get-ChildItem -LiteralPath $Directory -Filter '*.ps1' -File -ErrorAction Stop | Sort-Object Name)
+        if ($files.Count -eq 0) {
+            throw "UI 方法目录不包含 PowerShell 文件: $Directory"
         }
-        if ($ast.ParamBlock -or $ast.BeginBlock -or $ast.ProcessBlock -or $ast.DynamicParamBlock -or
-            $ast.UsingStatements.Count -gt 0 -or -not $ast.EndBlock) {
-            throw 'UI 方法文件只能包含函数定义。'
-        }
-
         $newDefinitions = @{}
-        foreach ($statement in $ast.EndBlock.Statements) {
-            if ($statement -isnot [System.Management.Automation.Language.FunctionDefinitionAst] -or
-                $statement.IsFilter -or $statement.IsWorkflow -or
-                $statement.Name -notmatch '^[A-Za-z][A-Za-z0-9_-]*$') {
-                throw 'UI 方法文件只能包含未指定作用域的函数定义。'
+        foreach ($file in $files) {
+            $source = [System.IO.File]::ReadAllText($file.FullName)
+            $tokens = $null
+            $parseErrors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, $file.FullName, [ref]$tokens, [ref]$parseErrors)
+            if ($parseErrors.Count -gt 0) {
+                throw ($parseErrors | ForEach-Object { $_.ToString() } | Out-String)
             }
-            if ($newDefinitions.ContainsKey($statement.Name)) {
-                throw "UI 方法重复: $($statement.Name)"
+            if ($ast.ParamBlock -or $ast.BeginBlock -or $ast.ProcessBlock -or $ast.DynamicParamBlock -or
+                $ast.UsingStatements.Count -gt 0 -or -not $ast.EndBlock) {
+                throw "UI 方法文件只能包含函数定义: $($file.Name)"
             }
-            if (-not $SyncHash.UiFunctionDefinitions.ContainsKey($statement.Name) -and
-                (Get-Command -Name $statement.Name -CommandType Function -ErrorAction SilentlyContinue)) {
-                throw "UI 方法与现有函数冲突: $($statement.Name)"
+
+            foreach ($statement in $ast.EndBlock.Statements) {
+                if ($statement -isnot [System.Management.Automation.Language.FunctionDefinitionAst] -or
+                    $statement.IsFilter -or $statement.IsWorkflow -or
+                    $statement.Name -notmatch '^[A-Za-z][A-Za-z0-9_-]*$') {
+                    throw "UI 方法文件只能包含未指定作用域的函数定义: $($file.Name)"
+                }
+                if ($newDefinitions.ContainsKey($statement.Name)) {
+                    throw "UI 方法重复 '$($statement.Name)': $($file.Name)"
+                }
+                if (-not $SyncHash.UiFunctionDefinitions.ContainsKey($statement.Name) -and
+                    (Get-Command -Name $statement.Name -CommandType Function -ErrorAction SilentlyContinue)) {
+                    throw "UI 方法与现有函数冲突: $($statement.Name)"
+                }
+                $newDefinitions[$statement.Name] = $statement.Body.GetScriptBlock()
             }
-            $newDefinitions[$statement.Name] = $statement.Body.GetScriptBlock()
         }
         if ($newDefinitions.Count -eq 0) {
-            throw 'UI 方法文件不包含函数定义。'
+            throw "UI 方法目录不包含函数定义: $Directory"
         }
         foreach ($name in $SyncHash.UiFunctionDefinitions.Keys) {
             if (-not $newDefinitions.ContainsKey($name)) {
@@ -258,9 +264,9 @@ namespace ScriptRunner
         return $window
     }
 
-    $uiFunctionsPath = Join-Path $SyncHash.ScriptRoot 'ui\functions.ps1'
+    $uiFunctionsDirectory = Join-Path $SyncHash.ScriptRoot 'ui'
     try {
-        Import-UiFunctions -Path $uiFunctionsPath
+        Import-UiFunctions -Directory $uiFunctionsDirectory
     } catch {
         $SyncHash.Host.UI.WriteErrorLine("加载 UI 方法失败: $_")
         [void][System.Windows.MessageBox]::Show("加载 UI 方法失败: $_", '提示', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
@@ -310,10 +316,8 @@ namespace ScriptRunner
         $watcher = [ScriptRunner.ConfigChangeSignal]::new($configDirectory, $configFileName)
         $SyncHash.ConfigWatcher = $watcher
 
-        $uiFunctionsDirectory = [System.IO.Path]::GetDirectoryName($uiFunctionsPath)
-        $uiFunctionsFileName = [System.IO.Path]::GetFileName($uiFunctionsPath)
-        $SyncHash.UiFunctionsWatcher = [ScriptRunner.ConfigChangeSignal]::new($uiFunctionsDirectory, $uiFunctionsFileName)
-        Import-UiFunctions -Path $uiFunctionsPath -Refresh
+        $SyncHash.UiFunctionsWatcher = [ScriptRunner.ConfigChangeSignal]::new($uiFunctionsDirectory, '*.ps1')
+        Import-UiFunctions -Directory $uiFunctionsDirectory -Refresh
 
         $configRefreshTimer = [System.Windows.Threading.DispatcherTimer]::new()
         $configRefreshTimer.Interval = [TimeSpan]::FromMilliseconds(400)
@@ -351,7 +355,7 @@ namespace ScriptRunner
 
             $SyncHash.UiFunctionsLastProcessedUtcTicks = $changeTicks
             try {
-                Import-UiFunctions -Path $uiFunctionsPath -Refresh
+                Import-UiFunctions -Directory $uiFunctionsDirectory -Refresh
             } catch {
                 Show-Message "热更新 UI 方法失败，仍保留上一次有效方法和操作界面: $_" ([System.Windows.MessageBoxImage]::Error)
             }

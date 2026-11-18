@@ -51,7 +51,11 @@ function Wait-TestCondition {
 
 $directory = Join-Path ([System.IO.Path]::GetTempPath()) ("ScriptRunnerTest-" + [guid]::NewGuid())
 [void][System.IO.Directory]::CreateDirectory($directory)
-$uiFunctionsPath = Join-Path $directory 'functions.ps1'
+$uiDirectory = Join-Path $directory 'ui'
+[void][System.IO.Directory]::CreateDirectory($uiDirectory)
+$uiFunctionsPath = Join-Path $uiDirectory 'functions.ps1'
+$scheduledTogglePath = Join-Path $uiDirectory 'scheduled_toggle.ps1'
+$customControlPath = Join-Path $uiDirectory 'test_control.ps1'
 $jobPath = Join-Path $directory 'job.ps1'
 $configPath = Join-Path $directory 'config.json'
 $timer = $null
@@ -72,8 +76,10 @@ $SyncHash = @{
 
 try {
     $source = [System.IO.File]::ReadAllText((Join-Path $root 'ui\functions.ps1'))
+    $toggleSource = [System.IO.File]::ReadAllText((Join-Path $root 'ui\scheduled_toggle.ps1'))
     $source = Replace-TestFunction $source 'Show-Message' 'function Show-Message { param($Message, $Icon) [void]$SyncHash.TestMessages.Add($Message) }'
     [System.IO.File]::WriteAllText($uiFunctionsPath, $source)
+    [System.IO.File]::WriteAllText($scheduledTogglePath, $toggleSource)
     [System.IO.File]::WriteAllText($jobPath, "while (`$true) { Write-Output 'tick'; Start-Sleep -Milliseconds 120 }")
     $config = @{
         ui = @{ useBuiltInOutput = $true }
@@ -83,7 +89,7 @@ try {
     [System.IO.File]::WriteAllText($configPath, $config)
 
     Initialize-UiHelperTypes
-    Import-UiFunctions -Path $uiFunctionsPath
+    Import-UiFunctions -Directory $uiDirectory
     $SyncHash.Config = Read-ValidatedConfig -Path $configPath
     $SyncHash.ScheduledOnStartCallback = { param($JobName) Invoke-ScheduledOnStart -JobName $JobName }
     $SyncHash.ScheduledOnExitCallback = { param($JobName) Invoke-ScheduledOnExit -JobName $JobName }
@@ -130,8 +136,9 @@ try {
         throw 'Start button pressed background is incorrect'
     }
     Set-ScheduledToggleBackground -Button $toggleButton
-    $watcher = [ScriptRunner.ConfigChangeSignal]::new($directory, 'functions.ps1')
+    $watcher = [ScriptRunner.ConfigChangeSignal]::new($uiDirectory, '*.ps1')
     $SyncHash.UiFunctionsWatcher = $watcher
+    $uiFunctionsDirectory = $uiDirectory
 
     $tick = $mainAst.Find({
         param($node)
@@ -153,6 +160,36 @@ try {
     $pidBefore = $job.ProcessId
     $outputTab = $job.OutputTab
     Wait-TestCondition { $job.OutputTextBox.Text.Contains('tick') } 'initial job output'
+
+    [System.IO.File]::WriteAllText($customControlPath, "function New-TestControl { 'loaded' }")
+    Wait-TestCondition {
+        (Get-Command New-TestControl -CommandType Function -ErrorAction SilentlyContinue) -and
+        $SyncHash.UiFunctionsLastProcessedUtcTicks -ge $watcher.LastChangeUtcTicks
+    } 'automatic discovery of a new control file'
+    if ((New-TestControl) -ne 'loaded' -or $job.Process.HasExited -or
+        $job.ProcessId -ne $pidBefore -or -not [object]::ReferenceEquals($job.OutputTab, $outputTab)) {
+        throw 'Adding a custom control file did not hot-reload while preserving the active job'
+    }
+
+    $toggleUpdated = $toggleSource.Replace('#F0DDDD', '#F1DDDD')
+    if ($toggleUpdated -ceq $toggleSource) { throw 'Scheduled toggle test replacement did not match' }
+    [System.IO.File]::WriteAllText($scheduledTogglePath, $toggleUpdated)
+    Wait-TestCondition {
+        $SyncHash.ScheduledUi[0].ToggleButton.Background.ToString() -eq '#FFF1DDDD' -or
+        $SyncHash.TestMessages.Count -gt 0 -or
+        ($watcher.LastChangeUtcTicks -gt 0 -and
+            $SyncHash.UiFunctionsLastProcessedUtcTicks -ge $watcher.LastChangeUtcTicks)
+    } 'automatic reload of dedicated control file'
+    if ($SyncHash.ScheduledUi[0].ToggleButton.Background.ToString() -ne '#FFF1DDDD') {
+        throw 'Dedicated control file did not update the running-state button background'
+    }
+    if ($job.Process.HasExited -or $job.ProcessId -ne $pidBefore -or
+        -not [object]::ReferenceEquals($job.OutputTab, $outputTab)) {
+        throw 'Reloading the dedicated control file did not preserve the active job and output tab'
+    }
+
+    [System.IO.File]::WriteAllText($scheduledTogglePath, $toggleSource)
+    Wait-TestCondition { $SyncHash.ScheduledUi[0].ToggleButton.Background.ToString() -eq '#FFF0DDDD' } 'restore dedicated control file'
 
     $updated = $source.Replace('$button.Height = 25', '$button.Height = 42').Replace('$TextBox.AppendText($Line + [Environment]::NewLine)', '$TextBox.AppendText("updated: " + $Line + [Environment]::NewLine)')
     if ($updated -ceq $source) { throw 'Test replacements did not match' }
@@ -210,7 +247,7 @@ try {
         $SyncHash.ScheduledUi[0].ToggleButton.Tag -ne 'Stopped') {
         throw 'Rebuilt toggle button did not stop the job and return to the start state'
     }
-    'PASS: native button template, state backgrounds, hover/pressed colors, automatic reload, active job and output, rollback, removal, recovery'
+    'PASS: UI extension discovery, custom control reload, native button template, state backgrounds, hover/pressed colors, active job and output, rollback, recovery'
 } finally {
     if ($timer) { $timer.Stop() }
     if ($watcher) { $watcher.Dispose() }
